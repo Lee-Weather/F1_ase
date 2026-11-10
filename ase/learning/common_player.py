@@ -179,6 +179,9 @@ class CommonPlayer(players.PpoPlayerContinuous):
             'input_shape' : obs_shape,
             'num_seqs' : self.num_agents
         } 
+        if self.config.get('privileged_critic', False):
+            config['critic_input_shape'] = self.env_info['state_space'].shape
+            config['normalize_critic_input'] = self.normalize_input
         return config
 
     def _setup_action_space(self):

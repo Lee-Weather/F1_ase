@@ -43,6 +43,8 @@ class ASEAgent(amp_agent.AMPAgent):
         for n in range(self.horizon_length):
             self.obs = self.env_reset(done_indices)
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            if self._use_privileged_critic:
+                self.experience_buffer.update_data('critic_obs', n, self.obs['states'])
 
             self._update_latents()
 
@@ -125,6 +127,8 @@ class ASEAgent(amp_agent.AMPAgent):
             'rnn_states' : self.rnn_states,
             'ase_latents': ase_latents
         }
+        if self._use_privileged_critic:
+            input_dict['critic_obs'] = obs_dict['states']
 
         with torch.no_grad():
             res_dict = self.model(input_dict)
@@ -200,6 +204,9 @@ class ASEAgent(amp_agent.AMPAgent):
             'amp_obs_demo' : amp_obs_demo,
             'ase_latents': ase_latents
         }
+
+        if self._use_privileged_critic:
+            batch_dict['critic_obs'] = input_dict['critic_obs']
 
         rnn_masks = None
         if self.is_rnn:
@@ -384,8 +391,7 @@ class ASEAgent(amp_agent.AMPAgent):
 
     def _eval_critic(self, obs_dict, ase_latents):
         self.model.eval()
-        obs = obs_dict['obs']
-        processed_obs = self._preproc_obs(obs)
+        processed_obs = self._critic_input(obs_dict)
         value = self.model.a2c_network.eval_critic(processed_obs, ase_latents)
 
         if self.normalize_value:

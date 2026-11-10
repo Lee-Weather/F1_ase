@@ -69,6 +69,8 @@ class AMPAgent(common_agent.CommonAgent):
 
             self.obs = self.env_reset(done_indices)
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            if self._use_privileged_critic:
+                self.experience_buffer.update_data('critic_obs', n, self.obs['states'])
 
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
@@ -146,6 +148,8 @@ class AMPAgent(common_agent.CommonAgent):
             'obs' : processed_obs,
             'rnn_states' : self.rnn_states
         }
+        if self._use_privileged_critic:
+            input_dict['critic_obs'] = obs_dict['states']
 
         with torch.no_grad():
             res_dict = self.model(input_dict)
@@ -301,6 +305,9 @@ class AMPAgent(common_agent.CommonAgent):
             'amp_obs_replay' : amp_obs_replay,
             'amp_obs_demo' : amp_obs_demo
         }
+
+        if self._use_privileged_critic:
+            batch_dict['critic_obs'] = input_dict['critic_obs']
 
         rnn_masks = None
         if self.is_rnn:

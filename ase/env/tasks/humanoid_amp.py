@@ -7,7 +7,6 @@ from isaacgym import gymtorch
 
 from env.tasks.humanoid import Humanoid, dof_to_obs
 from utils import gym_util
-from utils.motion_lib import MotionLib
 from isaacgym.torch_utils import *
 
 from utils import torch_utils
@@ -94,7 +93,7 @@ class HumanoidAMP(Humanoid):
         motion_times = motion_times.view(-1)
         root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, key_pos \
                = self._motion_lib.get_motion_state(motion_ids, motion_times)
-        amp_obs_demo = build_amp_observations(root_pos, root_rot, root_vel, root_ang_vel,
+        amp_obs_demo = self._build_amp_observations(root_pos, root_rot, root_vel, root_ang_vel,
                                               dof_pos, dof_vel, key_pos,
                                               self._local_root_obs, self._root_height_obs,
                                               self._dof_obs_size, self._dof_offsets)
@@ -121,6 +120,7 @@ class HumanoidAMP(Humanoid):
         return
 
     def _load_motion(self, motion_file):
+        from utils.motion_lib import MotionLib
         assert(self._dof_offsets[-1] == self.num_dof)
         self._motion_lib = MotionLib(motion_file=motion_file,
                                      dof_body_ids=self._dof_body_ids,
@@ -228,7 +228,7 @@ class HumanoidAMP(Humanoid):
         motion_times = motion_times.view(-1)
         root_pos, root_rot, dof_pos, root_vel, root_ang_vel, dof_vel, key_pos \
                = self._motion_lib.get_motion_state(motion_ids, motion_times)
-        amp_obs_demo = build_amp_observations(root_pos, root_rot, root_vel, root_ang_vel, 
+        amp_obs_demo = self._build_amp_observations(root_pos, root_rot, root_vel, root_ang_vel,
                                               dof_pos, dof_vel, key_pos, 
                                               self._local_root_obs, self._root_height_obs, 
                                               self._dof_obs_size, self._dof_offsets)
@@ -257,7 +257,7 @@ class HumanoidAMP(Humanoid):
     def _compute_amp_observations(self, env_ids=None):
         key_body_pos = self._rigid_body_pos[:, self._key_body_ids, :]
         if (env_ids is None):
-            self._curr_amp_obs_buf[:] = build_amp_observations(self._rigid_body_pos[:, 0, :],
+            self._curr_amp_obs_buf[:] = self._build_amp_observations(self._rigid_body_pos[:, 0, :],
                                                                self._rigid_body_rot[:, 0, :],
                                                                self._rigid_body_vel[:, 0, :],
                                                                self._rigid_body_ang_vel[:, 0, :],
@@ -265,7 +265,7 @@ class HumanoidAMP(Humanoid):
                                                                self._local_root_obs, self._root_height_obs, 
                                                                self._dof_obs_size, self._dof_offsets)
         else:
-            self._curr_amp_obs_buf[env_ids] = build_amp_observations(self._rigid_body_pos[env_ids][:, 0, :],
+            self._curr_amp_obs_buf[env_ids] = self._build_amp_observations(self._rigid_body_pos[env_ids][:, 0, :],
                                                                    self._rigid_body_rot[env_ids][:, 0, :],
                                                                    self._rigid_body_vel[env_ids][:, 0, :],
                                                                    self._rigid_body_ang_vel[env_ids][:, 0, :],
@@ -273,6 +273,10 @@ class HumanoidAMP(Humanoid):
                                                                    self._local_root_obs, self._root_height_obs, 
                                                                    self._dof_obs_size, self._dof_offsets)
         return
+
+
+    def _build_amp_observations(self, *args):
+        return build_amp_observations(*args)
 
 
 #####################################################################

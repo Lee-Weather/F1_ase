@@ -1,6 +1,7 @@
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch import layers
 from rl_games.algos_torch import network_builder
+from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,21 @@ class AMPBuilder(network_builder.A2CBuilder):
     class Network(network_builder.A2CBuilder.Network):
         def __init__(self, params, **kwargs):
             super().__init__(params, **kwargs)
+            critic_shape = kwargs.get('critic_input_shape')
+            self._privileged_critic = critic_shape is not None
+            self.critic_input_mean_std = None
+            if self._privileged_critic:
+                if not self.separate:
+                    raise ValueError('Privileged critic requires separate actor/critic networks')
+                self.critic_mlp = self._build_mlp(input_size=critic_shape[-1], units=self.units,
+                                                   activation=self.activation, dense_func=nn.Linear)
+                initializer = self.init_factory.create(**self.initializer)
+                for layer in self.critic_mlp.modules():
+                    if isinstance(layer, nn.Linear):
+                        initializer(layer.weight)
+                        nn.init.zeros_(layer.bias)
+                if kwargs.get('normalize_critic_input', False):
+                    self.critic_input_mean_std = RunningMeanStd(critic_shape)
 
             if self.is_continuous:
                 if (not self.space_config['learn_sigma']):
@@ -42,7 +58,16 @@ class AMPBuilder(network_builder.A2CBuilder):
             states = obs_dict.get('rnn_states', None)
 
             actor_outputs = self.eval_actor(obs)
-            value = self.eval_critic(obs)
+            if self._privileged_critic:
+                critic_obs = obs_dict.get('critic_obs')
+                if critic_obs is None:
+                    if obs_dict.get('is_train', True):
+                        raise ValueError('Training requires privileged critic_obs')
+                    value = obs.new_zeros((obs.shape[0], self.value_size))
+                else:
+                    value = self.eval_critic(critic_obs)
+            else:
+                value = self.eval_critic(obs)
 
             output = actor_outputs + (value, states)
 
@@ -72,6 +97,8 @@ class AMPBuilder(network_builder.A2CBuilder):
             return
 
         def eval_critic(self, obs):
+            if self.critic_input_mean_std is not None:
+                obs = self.critic_input_mean_std(obs)
             c_out = self.critic_cnn(obs)
             c_out = c_out.contiguous().view(c_out.size(0), -1)
             c_out = self.critic_mlp(c_out)              

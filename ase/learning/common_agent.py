@@ -27,6 +27,9 @@ class CommonAgent(a2c_continuous.A2CAgent):
         a2c_common.A2CBase.__init__(self, base_name, config)
 
         self._load_config_params(config)
+        self._use_privileged_critic = config.get('privileged_critic', False)
+        if self._use_privileged_critic and self.has_central_value:
+            raise ValueError('privileged_critic uses the policy value head; disable central_value_config')
 
         self.is_discrete = False
         self._setup_action_space()
@@ -77,6 +80,10 @@ class CommonAgent(a2c_continuous.A2CAgent):
         self.experience_buffer.tensor_dict['next_values'] = torch.zeros_like(self.experience_buffer.tensor_dict['values'])
 
         self.tensor_list += ['next_obses']
+        if self._use_privileged_critic:
+            shape = self.experience_buffer.obs_base_shape + self.env_info['state_space'].shape
+            self.experience_buffer.tensor_dict['critic_obs'] = torch.zeros(shape, device=self.ppo_device)
+            self.tensor_list += ['critic_obs']
         return
 
     def train(self):
@@ -146,7 +153,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
                             int_model_output_file = model_output_file + '_' + str(epoch_num).zfill(8)
                             self.save(int_model_output_file)
 
-                if epoch_num > self.max_epochs:
+                if epoch_num >= self.max_epochs:
                     self.save(model_output_file)
                     print('MAX EPOCHS NUM!')
                     return self.last_mean_rewards, epoch_num
@@ -335,6 +342,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
         dataset_dict['rnn_masks'] = rnn_masks
         dataset_dict['mu'] = mus
         dataset_dict['sigma'] = sigmas
+        if self._use_privileged_critic:
+            dataset_dict['critic_obs'] = batch_dict['critic_obs']
 
         self.dataset.update_values_dict(dataset_dict)
 
@@ -478,6 +487,9 @@ class CommonAgent(a2c_continuous.A2CAgent):
             'num_seqs' : self.num_actors * self.num_agents,
             'value_size': self.env_info.get('value_size', 1),
         }
+        if self._use_privileged_critic:
+            config['critic_input_shape'] = self.env_info['state_space'].shape
+            config['normalize_critic_input'] = self.normalize_input
         return config
 
     def _setup_action_space(self):
@@ -494,13 +506,17 @@ class CommonAgent(a2c_continuous.A2CAgent):
 
     def _eval_critic(self, obs_dict):
         self.model.eval()
-        obs = obs_dict['obs']
-        processed_obs = self._preproc_obs(obs)
+        processed_obs = self._critic_input(obs_dict)
         value = self.model.a2c_network.eval_critic(processed_obs)
 
         if self.normalize_value:
             value = self.value_mean_std(value, True)
         return value
+
+    def _critic_input(self, obs_dict):
+        if self._use_privileged_critic:
+            return obs_dict['states']
+        return self._preproc_obs(obs_dict['obs'])
 
     def _actor_loss(self, old_action_log_probs_batch, action_log_probs, advantage, curr_e_clip):
         ratio = torch.exp(old_action_log_probs_batch - action_log_probs)

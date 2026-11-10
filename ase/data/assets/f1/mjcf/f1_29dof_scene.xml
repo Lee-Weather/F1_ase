@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mujoco model="f1_29dof_scene">
+  <include file="weichai_f1_29.xml"/>
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+  <worldbody>
+    <!-- The included robot MJCF already carries a "ground" plane at z=0; do not add a second one. -->
+    <light name="light0" diffuse="0.9 0.9 0.9" specular="0.3 0.3 0.3"
+           pos="0 -3 4" dir="0 0 -1"/>
+    <light name="light1" mode="targetbodycom" target="base_link"
+           pos="-2 3 4" diffuse="0.7 0.7 0.7"/>
+  </worldbody>
+</mujoco>

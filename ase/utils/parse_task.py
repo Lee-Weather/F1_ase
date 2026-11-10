@@ -7,6 +7,7 @@ from env.tasks.humanoid_strike import HumanoidStrike
 from env.tasks.humanoid_reach import HumanoidReach
 from env.tasks.humanoid_perturb import HumanoidPerturb
 from env.tasks.humanoid_view_motion import HumanoidViewMotion
+from env.tasks.humanoid_f1 import HumanoidF1, HumanoidF1ViewMotion
 from env.tasks.vec_task_wrappers import VecTaskPythonWrapper
 
 from isaacgym import rlgpu

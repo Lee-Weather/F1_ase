@@ -103,9 +103,7 @@ class RLGPUEnv(vecenv.IVecEnv):
         self.use_global_obs = (self.env.num_states > 0)
 
         self.full_state = {}
-        self.full_state["obs"] = self.reset()
-        if self.use_global_obs:
-            self.full_state["states"] = self.env.get_state()
+        self.reset()
         return
 
     def step(self, action):

@@ -1,0 +1,85 @@
+env:
+  numEnvs: 4096
+  envSpacing: 5
+  episodeLength: 500
+  enableDebugVis: false
+  pdControl: true
+  powerScale: 1.0
+  actionScale: 0.5
+  armature: 0.01
+  initialHeight: 0.61
+  controlFrequencyInv: 2
+  stateInit: Hybrid
+  hybridInitProb: 0.5
+  numAMPObsSteps: 10
+  localRootObs: true
+  rootHeightObs: true
+  keyBodies: [base_link, lumbar_pitch_link, left_ankle_roll_link, right_ankle_roll_link, left_wrist_roll_link, right_wrist_roll_link]
+  contactBodies: [left_ankle_roll_link, right_ankle_roll_link, left_wrist_roll_link, right_wrist_roll_link]
+  forceSensorBodies: [right_ankle_roll_link, left_ankle_roll_link]
+  terminationHeight: 0.32
+  terminationTilt: 1.0
+  terminationContactForce: 1.0
+  enableEarlyTermination: true
+  asset:
+    assetRoot: ase/data/assets
+    assetFileName: f1/mjcf/weichai_f1_29.xml
+  plane:
+    staticFriction: 0.8
+    dynamicFriction: 0.8
+    restitution: 0.0
+  # Reference values from czy/f1_wbt/robots/f1.py; armature remains an estimate.
+  pdGains:
+    hip_pitch: [70.0, 5.8]
+    hip_roll: [60.0, 4.5]
+    hip_yaw: [35.0, 4.0]
+    knee_pitch: [115.0, 11.5]
+    ankle_pitch: [75.0, 1.25]
+    ankle_roll: [50.0, 0.75]
+    lumbar: [120.0, 8.0]
+    shoulder: [35.0, 2.0]
+    elbow: [35.0, 2.0]
+    wrist: [20.0, 1.0]
+  defaultJointPos:
+    lumbar_yaw_joint: -0.041
+    lumbar_roll_joint: -0.056
+    lumbar_pitch_joint: 0.020
+    left_shoulder_pitch_joint: 0.107
+    left_shoulder_roll_joint: -0.273
+    left_shoulder_yaw_joint: -0.350
+    left_elbow_pitch_joint: 0.563
+    left_elbow_yaw_joint: 0.223
+    left_wrist_pitch_joint: 0.307
+    left_wrist_roll_joint: -0.010
+    right_shoulder_pitch_joint: 0.076
+    right_shoulder_roll_joint: -0.270
+    right_shoulder_yaw_joint: 0.339
+    right_elbow_pitch_joint: 0.670
+    right_elbow_yaw_joint: -0.089
+    right_wrist_pitch_joint: -0.178
+    right_wrist_roll_joint: 0.003
+    left_hip_pitch_joint: 0.034
+    left_hip_roll_joint: -0.063
+    left_hip_yaw_joint: -0.101
+    left_knee_pitch_joint: 0.000
+    left_ankle_pitch_joint: -0.060
+    left_ankle_roll_joint: 0.065
+    right_hip_pitch_joint: 0.011
+    right_hip_roll_joint: 0.095
+    right_hip_yaw_joint: 0.000
+    right_knee_pitch_joint: 0.046
+    right_ankle_pitch_joint: -0.071
+    right_ankle_roll_joint: 0.009
+sim:
+  dt: 0.01
+  substeps: 2
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 8
+    num_velocity_iterations: 4
+    contact_offset: 0.01
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1.0
+    default_buffer_size_multiplier: 10.0

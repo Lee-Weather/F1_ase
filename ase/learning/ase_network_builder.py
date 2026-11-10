@@ -1,6 +1,7 @@
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch import layers
 from rl_games.algos_torch import network_builder
+from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 import torch
 import torch.nn as nn
@@ -30,6 +31,12 @@ class ASEBuilder(amp_network_builder.AMPBuilder):
             self._ase_latent_shape = kwargs.get('ase_latent_shape')
 
             network_builder.NetworkBuilder.BaseNetwork.__init__(self)
+            critic_shape = kwargs.get('critic_input_shape')
+            self._privileged_critic = critic_shape is not None
+            self._critic_obs_size = critic_shape[-1] if critic_shape is not None else input_shape[-1]
+            self.critic_input_mean_std = None
+            if self._privileged_critic and kwargs.get('normalize_critic_input', False):
+                self.critic_input_mean_std = RunningMeanStd(critic_shape)
             
             self.load(params)
 
@@ -106,13 +113,24 @@ class ASEBuilder(amp_network_builder.AMPBuilder):
             use_hidden_latents = obs_dict.get('use_hidden_latents', False)
 
             actor_outputs = self.eval_actor(obs, ase_latents, use_hidden_latents)
-            value = self.eval_critic(obs, ase_latents, use_hidden_latents)
+            if self._privileged_critic:
+                critic_obs = obs_dict.get('critic_obs')
+                if critic_obs is None:
+                    if obs_dict.get('is_train', True):
+                        raise ValueError('Training requires privileged critic_obs')
+                    value = obs.new_zeros((obs.shape[0], self.value_size))
+                else:
+                    value = self.eval_critic(critic_obs, ase_latents, use_hidden_latents)
+            else:
+                value = self.eval_critic(obs, ase_latents, use_hidden_latents)
 
             output = actor_outputs + (value, states)
 
             return output
 
         def eval_critic(self, obs, ase_latents, use_hidden_latents=False):
+            if self.critic_input_mean_std is not None:
+                obs = self.critic_input_mean_std(obs)
             c_out = self.critic_cnn(obs)
             c_out = c_out.contiguous().view(c_out.size(0), -1)
             
@@ -171,7 +189,7 @@ class ASEBuilder(amp_network_builder.AMPBuilder):
                                              initializer=initializer)
 
             if self.separate:
-                self.critic_mlp = AMPMLPNet(obs_size=input_shape[-1],
+                self.critic_mlp = AMPMLPNet(obs_size=self._critic_obs_size,
                                             ase_latent_size=ase_latent_shape[-1],
                                             units=self.units,
                                             activation=act_fn,

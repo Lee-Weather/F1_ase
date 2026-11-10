@@ -233,15 +233,18 @@ class Humanoid(BaseTask):
         asset_options.angular_damping = 0.01
         asset_options.max_angular_velocity = 100.0
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
+        asset_options.armature = self.cfg["env"].get("armature", 0.0)
         #asset_options.fix_base_link = True
         humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+        self._configure_asset(humanoid_asset)
 
         actuator_props = self.gym.get_asset_actuator_properties(humanoid_asset)
         motor_efforts = [prop.motor_effort for prop in actuator_props]
         
         # create force sensors at the feet
-        right_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "right_foot")
-        left_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, "left_foot")
+        foot_names = self.cfg["env"].get("forceSensorBodies", ["right_foot", "left_foot"])
+        right_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, foot_names[0])
+        left_foot_idx = self.gym.find_asset_rigid_body_index(humanoid_asset, foot_names[1])
         sensor_pose = gymapi.Transform()
 
         self.gym.create_asset_force_sensor(humanoid_asset, right_foot_idx, sensor_pose)
@@ -283,6 +286,9 @@ class Humanoid(BaseTask):
 
         return
     
+    def _configure_asset(self, humanoid_asset):
+        pass
+
     def _build_env(self, env_id, env_ptr, humanoid_asset):
         col_group = env_id
         col_filter = self._get_humanoid_collision_filter()
@@ -290,7 +296,7 @@ class Humanoid(BaseTask):
 
         start_pose = gymapi.Transform()
         asset_file = self.cfg["env"]["asset"]["assetFileName"]
-        char_h = 0.89
+        char_h = self.cfg["env"].get("initialHeight", 0.89)
 
         start_pose.p = gymapi.Vec3(*get_axis_params(char_h, self.up_axis_idx))
         start_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
