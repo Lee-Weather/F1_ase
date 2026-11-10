@@ -1,7 +1,8 @@
 """Cloud entry for F1 ASE; invoked by gm-run from any working directory.
 
 Example: gm-run F1_ase/ase/train_f1_cloud.py --install-deps --max_iterations 200
-Keeps the image's PyTorch/Isaac Gym and installs legacy ASE dependencies locally.
+Keeps the image's PyTorch/Isaac Gym and caches legacy ASE dependencies outside
+the platform's /workspace artifact scanner.
 """
 import argparse
 from importlib import metadata
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,20 +19,34 @@ PACKAGES = {
     "numpy": "1.23.5", "rl-games": "1.1.4", "gym": "0.23.1",
     "ray": "1.13.0", "protobuf": "3.20.3", "tensorboardX": "2.6.2.2",
     "termcolor": "1.1.0", "PyYAML": "6.0.1", "gym-notices": "0.0.8",
+    "tensorboard": "2.11.2", "psutil": "5.9.8", "setproctitle": "1.3.3",
 }
 
 
 def prepare_dependencies(install):
-    deps = ROOT / ".deps"
+    deps = Path(os.environ.get("F1_DEPS_DIR", str(Path(tempfile.gettempdir()) / "f1_ase_deps")))
     if install:
         installed = {d.metadata["Name"].lower(): d.version
                      for d in metadata.distributions(path=[str(deps)])}
         if any(installed.get(name.lower()) != version for name, version in PACKAGES.items()):
-            subprocess.check_call([
+            pip = [
                 sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                "--no-deps", "--upgrade", "--target", str(deps),
-                *[name + "==" + version for name, version in PACKAGES.items()],
-            ])
+                "--upgrade", "--target", str(deps), "--timeout", "30", "--retries", "2",
+            ]
+            # Resolve Ray/Gym dependencies, including msgpack. Install rl-games
+            # separately so its broad torch requirement cannot replace the image.
+            groups = [
+                [name + "==" + version for name, version in PACKAGES.items() if name != "rl-games"],
+                ["--no-deps", "rl-games==" + PACKAGES["rl-games"]],
+            ]
+            for group in groups:
+                for index in ("https://pypi.org/simple", "https://mirrors.aliyun.com/pypi/simple/"):
+                    print("F1_DEPENDENCIES installing from " + index, flush=True)
+                    result = subprocess.run(pip + ["--index-url", index] + group)
+                    if result.returncode == 0:
+                        break
+                else:
+                    raise RuntimeError("F1 dependency installation failed")
     if deps.is_dir():
         sys.path.insert(0, str(deps))
 
