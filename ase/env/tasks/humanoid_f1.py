@@ -51,6 +51,16 @@ class HumanoidF1(HumanoidAMP):
         props = self._f1_dof_props.copy()
         props["driveMode"] = gymapi.DOF_MODE_POS if self._pd_control else gymapi.DOF_MODE_NONE
         self.gym.set_actor_dof_properties(env_ptr, self.humanoid_handles[-1], props)
+        # Imported convex leg meshes overlap within a kinematic chain. Shared
+        # bits exclude those pairs; disjoint bits preserve left/right collisions.
+        shapes = self.gym.get_actor_rigid_shape_properties(env_ptr, self.humanoid_handles[-1])
+        ranges = self.gym.get_actor_rigid_body_shape_indices(env_ptr, self.humanoid_handles[-1])
+        for group_id, names in enumerate(self.cfg["env"].get("selfCollisionFilterGroups", [])):
+            for name in names:
+                indices = ranges[self._body_names.index(name)]
+                for shape_id in range(indices.start, indices.start + indices.count):
+                    shapes[shape_id].filter |= 1 << group_id
+        self.gym.set_actor_rigid_shape_properties(env_ptr, self.humanoid_handles[-1], shapes)
 
     def _create_envs(self, *args):
         super()._create_envs(*args)
@@ -98,7 +108,10 @@ class HumanoidF1(HumanoidAMP):
         tilt = torch.acos(torch.clamp(-local_gravity[:, 2], -1, 1))
         contact = self._contact_forces.clone()
         contact[:, self._contact_body_ids] = 0
-        bad_contact = contact.norm(dim=-1).max(dim=-1)[0] > self.cfg["env"]["terminationContactForce"]
+        # Net forces also contain self contacts; a fall contact must be near
+        # the floor. Base height and tilt still terminate independently.
+        bad_contact = ((contact.norm(dim=-1) > self.cfg["env"]["terminationContactForce"]) &
+                       (self._rigid_body_pos[:, :, 2] < self.cfg["env"]["terminationContactHeight"])).any(dim=-1)
         fallen = ((self._rigid_body_pos[:, 0, 2] < self.cfg["env"]["terminationHeight"]) |
                   (tilt > self.cfg["env"]["terminationTilt"]) | bad_contact)
         fallen &= (self.progress_buf > 1) & self._enable_early_termination
