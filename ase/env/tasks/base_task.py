@@ -28,7 +28,7 @@ class BaseTask():
 
         # double check!
         self.graphics_device_id = self.device_id
-        if enable_camera_sensors == False and self.headless == True:
+        if not (enable_camera_sensors or cfg["env"].get("enableCameraSensors", False)) and self.headless:
             self.graphics_device_id = -1
 
         self.num_envs = cfg["env"]["numEnvs"]
