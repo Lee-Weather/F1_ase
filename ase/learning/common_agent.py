@@ -164,7 +164,17 @@ class CommonAgent(a2c_continuous.A2CAgent):
                 update_time = 0
         return
 
+    def get_full_state_weights(self):
+        weights = super().get_full_state_weights()
+        task = getattr(getattr(getattr(self, 'vec_env', None), 'env', None), 'task', None)
+        if hasattr(task, 'get_control_config'):
+            weights['control_config'] = task.get_control_config()
+        return weights
+
     def set_full_state_weights(self, weights):
+        task = getattr(getattr(getattr(self, 'vec_env', None), 'env', None), 'task', None)
+        if hasattr(task, 'validate_control_config'):
+            task.validate_control_config(weights.get('control_config'))
         self.set_weights(weights)
         self.epoch_num = weights['epoch']
         if self.has_central_value:

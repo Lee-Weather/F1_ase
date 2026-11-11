@@ -10,6 +10,7 @@ from env.tasks.humanoid_amp import HumanoidAMP
 from env.tasks.humanoid_view_motion import HumanoidViewMotion
 from utils import torch_utils
 from utils.f1_motion_lib import F1MotionLib
+from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control, CONTROL_KEYS
 
 
 class HumanoidF1(HumanoidAMP):
@@ -17,6 +18,7 @@ class HumanoidF1(HumanoidAMP):
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self._initial_dof_pos[:] = self._default_joint_pos
         self.actions = torch.zeros((self.num_envs, 29), device=self.device)
+        self._episode_start_xy = self._humanoid_root_states[:, :2].clone()
         self._critic_body_ids = self._build_key_body_ids_tensor(self._critic_body_names)
 
     def _setup_character_props(self, key_bodies):
@@ -70,8 +72,24 @@ class HumanoidF1(HumanoidAMP):
         assert self._body_names[0] == "base_link"
 
     def _build_pd_action_offset_scale(self):
-        self._pd_action_offset = self._default_joint_pos.clone()
-        self._pd_action_scale = torch.full_like(self._pd_action_offset, self.cfg["env"]["actionScale"])
+        offset, negative, positive = pd_action_parameters(
+            self.cfg["env"], self._dof_names, self.dof_limits_lower.cpu().numpy(),
+            self.dof_limits_upper.cpu().numpy())
+        self._pd_action_offset = torch.as_tensor(offset, device=self.device)
+        self._pd_action_negative_scale = torch.as_tensor(negative, device=self.device)
+        self._pd_action_positive_scale = torch.as_tensor(positive, device=self.device)
+
+    def _action_to_pd_targets(self, action):
+        return action_to_targets(action, self._pd_action_offset,
+                                 self._pd_action_negative_scale, self._pd_action_positive_scale)
+
+    def get_control_config(self):
+        return {key: self.cfg["env"][key] for key in CONTROL_KEYS if key in self.cfg["env"]}
+
+    def validate_control_config(self, saved):
+        for key, value in checkpoint_control({"control_config": saved} if saved is not None else {}).items():
+            if self.cfg["env"].get(key) != value:
+                raise ValueError("Checkpoint control mismatch for " + key + "; start a fresh training run")
 
     def _build_termination_heights(self):
         # F1 termination uses the base height, tilt and disallowed contacts below.
@@ -85,6 +103,7 @@ class HumanoidF1(HumanoidAMP):
             return
         self.actions[env_ids] = 0
         super()._reset_envs(env_ids)
+        self._episode_start_xy[env_ids] = self._humanoid_root_states[env_ids, :2]
 
     def _compute_observations(self, env_ids=None):
         ids = slice(None) if env_ids is None else env_ids
@@ -125,6 +144,10 @@ class HumanoidF1(HumanoidAMP):
             "base_height": base_low & eligible,
             "base_tilt": base_tilt & eligible,
             "illegal_ground_contact": bad_contact & eligible,
+        }
+        self.extras["motion_metrics"] = {
+            "planar_speed_m_s": self._humanoid_root_states[:, 7:9].norm(dim=-1),
+            "completed_displacement_m": (self._humanoid_root_states[:, :2] - self._episode_start_xy).norm(dim=-1),
         }
 
     def _build_amp_observations(self, root_pos, root_rot, root_vel, root_ang_vel,

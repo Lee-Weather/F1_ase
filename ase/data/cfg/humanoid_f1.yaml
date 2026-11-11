@@ -6,6 +6,10 @@ env:
   pdControl: true
   powerScale: 1.0
   actionScale: 0.5
+  # Zero action retains the default posture. +/-1 spans URDF limits plus 10% travel.
+  # actionScale above is only used by legacy default_offset checkpoints.
+  actionMapping: joint_limits
+  actionLimitMargin: 0.1
   armature: 0.01
   initialHeight: 0.61
   controlFrequencyInv: 2

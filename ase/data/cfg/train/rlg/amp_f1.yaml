@@ -1,4 +1,4 @@
-# F1 preparation baseline. No training has been run.
+# F1 AMP baseline; choose a walking clip through the cloud entry's --motion-file.
 params:
   seed: -1
   algo:

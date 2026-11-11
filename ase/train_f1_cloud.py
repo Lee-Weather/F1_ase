@@ -1,4 +1,4 @@
-"""Cloud entry for F1 ASE; invoked by gm-run from any working directory.
+"""Cloud entry for F1 AMP/ASE; invoked by gm-run from any working directory.
 
 Example: gm-run F1_ase/ase/train_f1_cloud.py --install-deps --max_iterations 200
 Keeps the image's PyTorch/Isaac Gym and caches legacy ASE dependencies outside
@@ -92,6 +92,8 @@ def main():
     parser.add_argument("--max_iterations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_path", default="output")
+    parser.add_argument("--algorithm", choices=("ase", "amp"), default="ase")
+    parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
     parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
     args, extra = parser.parse_known_args()
     if args.max_iterations < 1 or args.num_envs < 1:
@@ -117,6 +119,14 @@ def main():
             for name, mask in infos.get("termination_reasons", {}).items():
                 count = mask.sum().detach()
                 self._termination_counts[name] = self._termination_counts.get(name, 0) + count
+            if not hasattr(self, "_motion_totals"):
+                self._motion_totals = {}
+            for name, values in infos.get("motion_metrics", {}).items():
+                if name == "completed_displacement_m":
+                    values = values[done_indices.reshape(-1)]
+                if values.numel():
+                    total, count = self._motion_totals.get(name, (0, 0))
+                    self._motion_totals[name] = (total + values.sum().detach(), count + values.numel())
 
         def after_print_stats(self, frame, epoch_num, total_time):
             super().after_print_stats(frame, epoch_num, total_time)
@@ -136,12 +146,21 @@ def main():
             for name, count in self._last_termination_counts.items():
                 self.writer.add_scalar("Episode_Termination/" + name, count, frame)
             self._termination_counts = {}
+            self._last_motion_metrics = {
+                "Metrics/motion/" + name: float(total / count)
+                for name, (total, count) in getattr(self, "_motion_totals", {}).items()
+            }
+            for name, value in self._last_motion_metrics.items():
+                self.writer.add_scalar(name, value, frame)
+            self._motion_totals = {}
+            result["motion"] = self._last_motion_metrics
 
         def format_train_stats(self, train_info, epoch_num, frame, total_time):
             if not hasattr(self, "_iteration_times"):
                 self._iteration_times = deque(maxlen=20)
             self._iteration_times.append(train_info["total_time"])
             metrics = {}
+            metrics.update(self._last_motion_metrics)
             sigmas = self.algo.experience_buffer.tensor_dict.get("sigmas")
             if sigmas is not None:
                 metrics["Mean action noise std"] = mean_metric(sigmas)
@@ -160,15 +179,17 @@ def main():
                                 "Mean episode duration (s)": summary["survival_s"]})
             task_reward = mean_metric(self.algo.experience_buffer.tensor_dict["rewards"])
             disc_reward = mean_metric(train_info["disc_rewards"])
-            enc_reward = mean_metric(train_info["enc_rewards"])
+            enc_reward = mean_metric(train_info["enc_rewards"]) if "enc_rewards" in train_info else 0.0
+            reward_prefix = args.algorithm.upper() + "_Reward/"
             metrics.update({
-                "ASE_Reward/combined_per_step": self.algo._task_reward_w * task_reward
-                    + self.algo._disc_reward_w * disc_reward + self.algo._enc_reward_w * enc_reward,
-                "ASE_Reward/discriminator": disc_reward,
-                "ASE_Reward/encoder": enc_reward,
+                reward_prefix + "combined_per_step": self.algo._task_reward_w * task_reward
+                    + self.algo._disc_reward_w * disc_reward + getattr(self.algo, "_enc_reward_w", 0.0) * enc_reward,
+                reward_prefix + "discriminator": disc_reward,
                 "PPO/learning_rate": self.algo.last_lr,
                 "PPO/clip_fraction": mean_metric(train_info["actor_clip_frac"]),
             })
+            if "enc_rewards" in train_info:
+                metrics[reward_prefix + "encoder"] = enc_reward
             block = format_training_log({
                 "epoch": epoch_num, "max_epochs": self.algo.max_epochs, "frame": frame,
                 "fps": self.algo.curr_frames / train_info["total_time"],
@@ -187,13 +208,14 @@ def main():
         "python": sys.version.split()[0], "torch": torch.__version__,
         "num_envs": args.num_envs, "max_iterations": args.max_iterations,
         "seed": args.seed, "control_hz": 50,
+        "algorithm": args.algorithm, "motion_file": args.motion_file,
     }), flush=True)
     sys.argv = [
         str(ROOT / "ase/run.py"), "--task", "HumanoidF1", "--headless",
         "--sim_device", "cuda:0", "--pipeline", "gpu", "--rl_device", "cuda:0",
         "--cfg_env", "ase/data/cfg/humanoid_f1.yaml",
-        "--cfg_train", "ase/data/cfg/train/rlg/ase_f1.yaml",
-        "--motion_file", "ase/data/motions/f1/dataset_f1.yaml",
+        "--cfg_train", "ase/data/cfg/train/rlg/" + args.algorithm + "_f1.yaml",
+        "--motion_file", args.motion_file,
         "--num_envs", str(args.num_envs), "--max_iterations", str(args.max_iterations),
         "--seed", str(args.seed), "--output_path", args.output_path,
         *extra,

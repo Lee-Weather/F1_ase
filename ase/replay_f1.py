@@ -1,4 +1,4 @@
-"""Replay an F1 ASE checkpoint in Isaac Gym or MuJoCo without training.
+"""Replay an F1 AMP/ASE checkpoint in Isaac Gym or MuJoCo without training.
 
 Example: python ase/replay_f1.py --engine mujoco --checkpoint MODEL --output DIR
 Both engines use the same deterministic actor, latent seeds and initial states.
@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import yaml
+from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSET = ROOT / "ase/data/assets/f1/mjcf/weichai_f1_29.xml"
@@ -32,24 +33,35 @@ def load_actor(checkpoint, device="cpu"):
     norm = ckpt["running_mean_std"]
     mean = norm["running_mean"].float().to(device)
     scale = torch.sqrt(norm["running_var"].float().to(device) + 1e-5)
+    is_ase = "actor_mlp._style_dense.weight" in weights
+    amp_layers = sorted(int(k.split(".")[1]) for k in weights
+                        if k.startswith("actor_mlp.") and k.endswith(".weight") and k.split(".")[1].isdigit())
 
     def linear(x, name):
         return F.linear(x, weights[name + ".weight"], weights[name + ".bias"])
 
     def actor(obs, latent):
         with torch.no_grad():
+            obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
             obs = torch.clamp((obs - mean) / scale, -5, 5)
-            style = F.relu(linear(latent, "actor_mlp._style_mlp.0"))
-            style = F.relu(linear(style, "actor_mlp._style_mlp.2"))
-            style = torch.tanh(linear(style, "actor_mlp._style_dense"))
-            hidden = torch.cat((obs, style), dim=-1)
-            for i in range(3):
-                hidden = F.relu(linear(hidden, "actor_mlp._dense_layers." + str(i)))
+            if is_ase:
+                style = F.relu(linear(latent, "actor_mlp._style_mlp.0"))
+                style = F.relu(linear(style, "actor_mlp._style_mlp.2"))
+                style = torch.tanh(linear(style, "actor_mlp._style_dense"))
+                hidden = torch.cat((obs, style), dim=-1)
+                for i in range(3):
+                    hidden = F.relu(linear(hidden, "actor_mlp._dense_layers." + str(i)))
+            else:
+                hidden = obs
+                for i in amp_layers:
+                    hidden = F.relu(linear(hidden, "actor_mlp." + str(i)))
             return linear(hidden, "mu").clamp(-1, 1)
 
     print(json.dumps({"checkpoint_epoch": ckpt["epoch"], "frame": ckpt.get("frame"),
                       "actor_observations": int(mean.numel()), "deterministic": True}), flush=True)
     actor.epoch = int(ckpt["epoch"])
+    actor.algorithm = "ASE" if is_ase else "AMP"
+    actor.control_config = checkpoint_control(ckpt)
     return actor
 
 
@@ -231,9 +243,12 @@ class MujocoReplay:
         gains = [next(v for k, v in self.cfg["pdGains"].items() if k in n) for n in names]
         self.kp, self.kd = np.array(gains).T
         urdf = ET.parse(ROOT / "ase/data/assets/f1/urdf/f1_29dof.urdf").getroot()
-        limits = {j.get("name"): float(j.find("limit").get("effort"))
+        limits = {j.get("name"): j.find("limit")
                   for j in urdf.findall("joint") if j.get("type") == "revolute"}
-        self.effort = np.array([limits[n] for n in names])
+        self.effort = np.array([float(limits[n].get("effort")) for n in names])
+        self.action_offset, self.action_negative, self.action_positive = pd_action_parameters(
+            self.cfg, names, [float(limits[n].get("lower")) for n in names],
+            [float(limits[n].get("upper")) for n in names])
         model.dof_damping[self.vids] = 0
         model.dof_armature[self.vids] = self.cfg["armature"]
         self.base = model.body("base_link").id
@@ -246,13 +261,12 @@ class MujocoReplay:
         self.device, self.dt = "cpu", .02
 
     def obs(self):
-        import torch
         rot = self.data.xmat[self.base].reshape(3, 3)
         velocity = np.zeros(6)
         self.mj.mj_objectVelocity(self.model, self.data, self.mj.mjtObj.mjOBJ_BODY, self.base, velocity, 0)
         obs = np.r_[rot.T @ velocity[:3], rot.T @ [0., 0., -1.],
                     self.data.qpos[self.qids] - self.default, self.data.qvel[self.vids], self.action]
-        return torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
+        return obs.astype(np.float32)[None, :]
 
     def reset(self, state):
         self.mj.mj_resetData(self.model, self.data)
@@ -265,8 +279,8 @@ class MujocoReplay:
         return self.obs()
 
     def step(self, action):
-        self.action = action[0].cpu().numpy()
-        target = self.default + self.cfg["actionScale"] * self.action
+        self.action = action[0].copy() if isinstance(action, np.ndarray) else action[0].cpu().numpy()
+        target = action_to_targets(self.action, self.action_offset, self.action_negative, self.action_positive)
         for _ in range(4):
             torque = self.kp * (target - self.data.qpos[self.qids]) - self.kd * self.data.qvel[self.vids]
             self.data.ctrl[self.aids] = np.clip(torque, -self.effort, self.effort)
@@ -330,9 +344,11 @@ def main():
     np.random.seed(args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load((ROOT / "ase/data/cfg/humanoid_f1.yaml").read_text())
+    actor = load_actor(args.checkpoint, "cuda:0" if args.engine == "gym" else "cpu")
+    cfg["env"].update(actor.control_config)
+    print("REPLAY_CONTROL " + json.dumps(actor.control_config), flush=True)
     names = joint_names()
     engine = GymReplay(cfg, names) if args.engine == "gym" else MujocoReplay(cfg, names)
-    actor = load_actor(args.checkpoint, engine.device)
     stem = "isaac" if args.engine == "gym" else "mujoco"
     video = Video(args.output / (stem + "_play.mp4"))
     summaries = []
@@ -345,7 +361,7 @@ def main():
             for case in range(args.cases):
                 state = initial_case(case, cfg, names)
                 obs = engine.reset(state)
-                mode = "switching" if case >= 8 else "fixed"
+                mode = ("switching" if case >= 8 else "fixed") if actor.algorithm == "ASE" else "none"
                 latent = Latents(args.seed + case, mode == "switching")
                 origin = state["root"][:2].copy()
                 for step in range(cfg["env"]["episodeLength"] - 1):
@@ -357,7 +373,7 @@ def main():
                                      *values, int(done), "+".join(reasons),
                                      float(action.square().mean().sqrt()), *q])
                     if step % 2 == 0 or done:
-                        label = ("F1 ASE epoch" + str(actor.epoch) + " | " + stem + " | case " + str(case+1) + "/" + str(args.cases)
+                        label = ("F1 " + actor.algorithm + " epoch" + str(actor.epoch) + " | " + stem + " | case " + str(case+1) + "/" + str(args.cases)
                                  + " | " + mode + " latent\n" + state["init"] + " | {:.2f}s | ".format((step+1)*engine.dt)
                                  + ("+".join(reasons) if done else "policy rollout"))
                         video.write(engine.render(), label)
