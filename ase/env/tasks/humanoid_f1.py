@@ -114,9 +114,9 @@ class HumanoidF1(HumanoidAMP):
                          quat_rotate_inverse(rot, gravity),
                          self._dof_pos[ids] - self._default_joint_pos,
                          self._dof_vel[ids], self.actions[ids]), dim=-1)
-        self.obs_buf[ids] = obs
+        self.obs_buf[ids, :93] = obs
         bodies = self._critic_body_ids
-        self.states_buf[ids] = compute_humanoid_observations_max(
+        self.states_buf[ids, :448] = compute_humanoid_observations_max(
             self._rigid_body_pos[ids][:, bodies], self._rigid_body_rot[ids][:, bodies],
             self._rigid_body_vel[ids][:, bodies], self._rigid_body_ang_vel[ids][:, bodies], False, True)
 

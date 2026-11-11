@@ -8,6 +8,7 @@ from isaacgym import gymutil
 import numpy as np
 import random
 import torch
+from utils.f1_velocity import load_env_config
 
 SIM_TIMESTEP = 1.0 / 60.0
 
@@ -53,8 +54,7 @@ def load_cfg(args):
     with open(os.path.join(os.getcwd(), args.cfg_train), 'r') as f:
         cfg_train = yaml.load(f, Loader=yaml.SafeLoader)
 
-    with open(os.path.join(os.getcwd(), args.cfg_env), 'r') as f:
-        cfg = yaml.load(f, Loader=yaml.SafeLoader)
+    cfg = load_env_config(os.path.join(os.getcwd(), args.cfg_env))
 
     # Override number of environments if passed on the command line
     if args.num_envs > 0:

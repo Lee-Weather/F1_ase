@@ -1,0 +1,12 @@
+# Probabilities select clips, not seconds. Reuse the existing NPZ files.
+motions:
+- file: A1_stand_weichai_f1_29.npz
+  weight: 0.25
+- file: B1_stand_to_walk_weichai_f1_29.npz
+  weight: 0.20
+- file: B3_walk1_weichai_f1_29.npz
+  weight: 0.25
+- file: B2_walk_to_stand_weichai_f1_29.npz
+  weight: 0.20
+- file: B2t2_walk_to_stand_weichai_f1_29.npz
+  weight: 0.10

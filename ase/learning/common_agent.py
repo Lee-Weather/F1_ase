@@ -169,12 +169,18 @@ class CommonAgent(a2c_continuous.A2CAgent):
         task = getattr(getattr(getattr(self, 'vec_env', None), 'env', None), 'task', None)
         if hasattr(task, 'get_control_config'):
             weights['control_config'] = task.get_control_config()
+        if hasattr(task, 'get_policy_config'):
+            weights['policy_config'] = task.get_policy_config()
         return weights
 
     def set_full_state_weights(self, weights):
         task = getattr(getattr(getattr(self, 'vec_env', None), 'env', None), 'task', None)
         if hasattr(task, 'validate_control_config'):
             task.validate_control_config(weights.get('control_config'))
+        if hasattr(task, 'validate_policy_config'):
+            task.validate_policy_config(weights.get('policy_config'))
+        elif weights.get('policy_config') is not None:
+            raise ValueError('This checkpoint requires its original task/observation schema')
         self.set_weights(weights)
         self.epoch_num = weights['epoch']
         if self.has_central_value:

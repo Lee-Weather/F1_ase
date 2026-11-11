@@ -9,6 +9,7 @@ from learning import ase_network_builder
 class ASEPlayer(amp_players.AMPPlayerContinuous):
     def __init__(self, config):
         self._latent_dim = config['latent_dim']
+        self._latent_hold_episode = config.get('latent_hold_episode', False)
         self._latent_steps_min = config.get('latent_steps_min', np.inf)
         self._latent_steps_max = config.get('latent_steps_max', np.inf)
 
@@ -80,6 +81,8 @@ class ASEPlayer(amp_players.AMPPlayerContinuous):
         return
 
     def _update_latents(self):
+        if self._latent_hold_episode:
+            return
         if (self._latent_step_count <= 0):
             self._reset_latents()
             self._reset_latent_step_count()

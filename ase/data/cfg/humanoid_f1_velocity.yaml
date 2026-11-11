@@ -1,0 +1,31 @@
+# Inherit the unchanged F1 asset, PD and control mapping.
+base: humanoid_f1.yaml
+env:
+  episodeLength: 1500
+  hybridInitProb: 0.3
+  velocityTask:
+    maxSpeed: 0.8
+    minMovingSpeed: 0.2
+    deadzone: 0.05
+    acceleration: 0.3
+    deceleration: 0.5
+    standDuration: [2.5, 4.0]
+    walkDuration: [4.0, 6.0]
+    encoderZeroSpeed: 0.05
+    encoderFullSpeed: 0.15
+    trackingSigma: 0.2
+    lateralSigma: 0.15
+    yawSigma: 0.3
+    tiltSigma: 0.35
+    quietJointSigma: 0.3
+    quietFootSigma: 0.08
+    stopSpeedGate: 0.15
+    rewardWeights:
+      lin_vel_tracking: 1.0
+      lateral_tracking: 0.3
+      yaw_tracking: 0.2
+      upright: 0.2
+      stand_quiet: 0.3
+      action_rate: 0.02
+      torque: 0.01
+      joint_limits: 0.01

@@ -611,6 +611,14 @@ class AMPAgent(common_agent.CommonAgent):
         # humanoid environment returns are constant-one rewards, hence lengths.
         task_rewards = a2c_common.swap_and_flatten01(self.experience_buffer.tensor_dict['rewards'])
         self._mean_training_reward = self._combine_rewards(task_rewards, train_info).mean().item()
+        self._training_reward_components = {
+            'task': self._task_reward_w * task_rewards.mean().item(),
+            'discriminator': self._disc_reward_w * train_info['disc_rewards'].mean().item(),
+        }
+        if 'enc_rewards' in train_info:
+            self._training_reward_components['encoder'] = self._enc_reward_w * train_info['enc_rewards'].mean().item()
+        for name, value in self._training_reward_components.items():
+            self.writer.add_scalar('Reward/weighted_' + name, value, frame)
 
         self.writer.add_scalar('losses/disc_loss', torch_ext.mean_list(train_info['disc_loss']).item(), frame)
 

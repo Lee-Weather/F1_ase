@@ -117,6 +117,70 @@ python ase/run.py --test --task HumanoidAMP --num_envs 16 --cfg_env ase/data/cfg
 
 &nbsp;
 
+### F1 velocity-conditioned ASE
+
+`HumanoidF1Velocity` adds forward speed commands to the F1 ASE actor. It retains
+the 32-dimensional latent and encoder, with one latent held per episode.
+Actor observations are 93 proprioceptive values plus three commands (96 total);
+the privileged critic has 451 inputs. The actor does not receive simulated base
+linear velocity or reference frames. Lateral/yaw commands are reserved at zero.
+
+The environment extends `humanoid_f1.yaml`, retaining the asset, PD gains and
+joint-limit action mapping. Its five-clip reference list reuses existing standing,
+walking and transition NPZs. Commands alternate between standing and walking at
+0.2–0.8 m/s, with acceleration/deceleration limits of 0.3/0.5 m/s². Encoder rewards
+and losses are masked around zero command and during initial history warmup.
+Task/discriminator/encoder reward weights start at 1.0/0.3/0.05.
+
+After simulation validation and training authorization, run from the repository root:
+
+```bash
+python ase/train_f1_cloud.py --task HumanoidF1Velocity --algorithm ase --num_envs 4096 --max_iterations 1000 --seed 42
+```
+
+The entry selects the velocity environment, training configuration and motion list.
+`--cfg-env`, `--cfg-train` and `--motion-file` allow explicit overrides. Old F1 AMP/ASE
+defaults remain available under `--task HumanoidF1`. Velocity checkpoints contain
+the observation schema, command settings and control metadata; they cannot be
+resumed as the old 93-input task.
+
+Once a velocity model exists, replay the continuous 45-second stand/walk/stop
+sequence in Isaac Gym (replace paths with the actual checkpoint/archive location):
+
+```bash
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model_1000.pt --output /path/to/czy/data/exp_f1_4 --command-profile walk-stop --cases 3
+```
+
+`--command-profile restart` checks a second start after stopping. Use `--cases 10
+--no-video` for numerical checks across ten episode latents. Summaries report
+steady speed MAE, stopping times, final standing motion and the final five-second
+path length. A finished sequence is marked `sequence_complete`, independently of
+numeric targets and human video review. Scripted commands never reset the robot.
+
+Interactive input is optional and uses [pygame joystick](https://www.pygame.org/docs/ref/joystick.html)
+(`pygame>=2` is needed only for this mode):
+
+```bash
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model_1000.pt --output /path/to/czy/data/exp_f1_4 --command-profile joystick --viewer --no-video --cases 1 --duration 60
+```
+
+The default axis is 1, negative direction for forward; `--axis`, `--axis-sign`,
+`--joystick` and `--stop-button` configure the device. Button 0 requests zero speed;
+a disconnected device also requests zero. The task applies the same command ramp
+used during training. No remote connection or automatic package installation is
+performed by replay.
+
+CPU functional checks require the existing torch/NumPy/PyYAML/rl-games packages,
+and do not require Isaac Gym, a server, or optimizer updates:
+
+```bash
+python -m unittest discover -s ase/tests -v
+```
+
+These checks cover command/reward timing with Gym I/O replaced, the actual ASE
+network and portable inference, masks and shuffled minibatches. They do not
+validate physical locomotion; that remains a separate Isaac Gym run.
+
 ### Motion Data
 
 Motion clips are located in `ase/data/motions/`. Individual motion clips are stored as `.npy` files. Motion datasets are specified by `.yaml` files, which contains a list of motion clips to be included in the dataset. Motion clips can be visualized with the following command:

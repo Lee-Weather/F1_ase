@@ -8,6 +8,7 @@ from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
 from utils import torch_utils
 from learning import ase_network_builder
+from utils.f1_velocity import masked_mean
 
 class ASEAgent(amp_agent.AMPAgent):
     def __init__(self, base_name, config):
@@ -25,6 +26,10 @@ class ASEAgent(amp_agent.AMPAgent):
                                          device=self.ppo_device)
         
         self.tensor_list += ['ase_latents']
+        if self._enc_command_mask:
+            self.experience_buffer.tensor_dict['enc_reward_mask'] = torch.zeros(
+                batch_shape + (1,), dtype=torch.float32, device=self.ppo_device)
+            self.tensor_list += ['enc_reward_mask']
 
         self._latent_reset_steps = torch.zeros(batch_shape[-1], dtype=torch.int32, device=self.ppo_device)
         num_envs = self.vec_env.env.task.num_envs
@@ -68,6 +73,8 @@ class ASEAgent(amp_agent.AMPAgent):
             self.experience_buffer.update_data('amp_obs', n, infos['amp_obs'])
             self.experience_buffer.update_data('ase_latents', n, self._ase_latents)
             self.experience_buffer.update_data('rand_action_mask', n, res_dict['rand_action_mask'])
+            if self._enc_command_mask:
+                self.experience_buffer.update_data('enc_reward_mask', n, infos['enc_reward_mask'])
 
             terminated = infos['terminate'].float()
             terminated = terminated.unsqueeze(-1)
@@ -101,7 +108,8 @@ class ASEAgent(amp_agent.AMPAgent):
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_amp_obs = self.experience_buffer.tensor_dict['amp_obs']
         mb_ase_latents = self.experience_buffer.tensor_dict['ase_latents']
-        amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_ase_latents)
+        enc_mask = self.experience_buffer.tensor_dict.get('enc_reward_mask')
+        amp_rewards = self._calc_amp_rewards(mb_amp_obs, mb_ase_latents, enc_mask)
         mb_rewards = self._combine_rewards(mb_rewards, amp_rewards)
         
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
@@ -156,6 +164,8 @@ class ASEAgent(amp_agent.AMPAgent):
         
         ase_latents = batch_dict['ase_latents']
         self.dataset.values_dict['ase_latents'] = ase_latents
+        if self._enc_command_mask:
+            self.dataset.values_dict['enc_reward_mask'] = batch_dict['enc_reward_mask']
         
         return
 
@@ -253,6 +263,8 @@ class ASEAgent(amp_agent.AMPAgent):
             
             enc_latents = batch_dict['ase_latents'][0:self._amp_minibatch_size]
             enc_loss_mask = rand_action_mask[0:self._amp_minibatch_size]
+            if self._enc_command_mask:
+                enc_loss_mask = input_dict['enc_reward_mask'][0:self._amp_minibatch_size]
             enc_info = self._enc_loss(enc_pred, enc_latents, batch_dict['amp_obs'], enc_loss_mask)
             enc_loss = enc_info['enc_loss']
 
@@ -328,6 +340,9 @@ class ASEAgent(amp_agent.AMPAgent):
         return obs
 
     def _reset_latent_step_count(self, env_ids):
+        if self._latent_hold_episode:
+            self._latent_reset_steps[env_ids] = 2147483647
+            return
         self._latent_reset_steps[env_ids] = torch.randint_like(self._latent_reset_steps[env_ids], low=self._latent_steps_min, 
                                                          high=self._latent_steps_max)
         return
@@ -348,6 +363,12 @@ class ASEAgent(amp_agent.AMPAgent):
         self._enc_grad_penalty = config['enc_grad_penalty']
 
         self._enc_reward_w = config['enc_reward_w']
+        self._latent_hold_episode = config.get('latent_hold_episode', False)
+        self._enc_command_mask = config.get('enc_command_mask', False)
+        task = getattr(getattr(getattr(self, 'vec_env', None), 'env', None), 'task', None)
+        if hasattr(task, 'velocity_settings') and not (
+                self._latent_dim == 32 and self._latent_hold_episode and self._enc_command_mask):
+            raise ValueError('F1 velocity ASE requires 32D episode-held latents and command encoder masks')
 
         return
     
@@ -371,6 +392,8 @@ class ASEAgent(amp_agent.AMPAgent):
         return z
 
     def _update_latents(self):
+        if self._latent_hold_episode:
+            return
         new_latent_envs = self._latent_reset_steps <= self.vec_env.env.task.progress_buf
 
         need_update = torch.any(new_latent_envs)
@@ -398,13 +421,16 @@ class ASEAgent(amp_agent.AMPAgent):
             value = self.value_mean_std(value, True)
         return value
 
-    def _calc_amp_rewards(self, amp_obs, ase_latents):
+    def _calc_amp_rewards(self, amp_obs, ase_latents, enc_mask=None):
         disc_r = self._calc_disc_rewards(amp_obs)
         enc_r = self._calc_enc_rewards(amp_obs, ase_latents)
         output = {
             'disc_rewards': disc_r,
             'enc_rewards': enc_r
         }
+        if enc_mask is not None:
+            output['enc_rewards_raw'] = enc_r
+            output['enc_rewards'] = enc_r * enc_mask
         return output
 
     def _calc_enc_rewards(self, amp_obs, ase_latents):
@@ -421,7 +447,7 @@ class ASEAgent(amp_agent.AMPAgent):
         #mask_sum = torch.sum(loss_mask)
         #enc_err = enc_err.squeeze(-1)
         #enc_loss = torch.sum(loss_mask * enc_err) / mask_sum
-        enc_loss = torch.mean(enc_err)
+        enc_loss = masked_mean(enc_err, loss_mask) if self._enc_command_mask else torch.mean(enc_err)
 
         # weight decay
         if (self._enc_weight_decay != 0):
@@ -440,7 +466,8 @@ class ASEAgent(amp_agent.AMPAgent):
             enc_obs_grad = enc_obs_grad[0]
             enc_obs_grad = torch.sum(torch.square(enc_obs_grad), dim=-1)
             #enc_grad_penalty = torch.sum(loss_mask * enc_obs_grad) / mask_sum
-            enc_grad_penalty = torch.mean(enc_obs_grad)
+            enc_grad_penalty = (masked_mean(enc_obs_grad, loss_mask)
+                                if self._enc_command_mask else torch.mean(enc_obs_grad))
 
             enc_loss += self._enc_grad_penalty * enc_grad_penalty
 
@@ -498,10 +525,14 @@ class ASEAgent(amp_agent.AMPAgent):
     def _record_train_batch_info(self, batch_dict, train_info):
         super()._record_train_batch_info(batch_dict, train_info)
         train_info['enc_rewards'] = batch_dict['enc_rewards']
+        if 'enc_rewards_raw' in batch_dict:
+            train_info['enc_rewards_raw'] = batch_dict['enc_rewards_raw']
         return
 
     def _log_train_info(self, train_info, frame):
         super()._log_train_info(train_info, frame)
+        if 'enc_rewards_raw' in train_info:
+            self.writer.add_scalar('info/enc_reward_raw_mean', train_info['enc_rewards_raw'].mean().item(), frame)
         
         self.writer.add_scalar('losses/enc_loss', torch_ext.mean_list(train_info['enc_loss']).item(), frame)
          
