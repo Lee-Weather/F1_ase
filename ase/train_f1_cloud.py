@@ -131,13 +131,16 @@ def main():
         def after_print_stats(self, frame, epoch_num, total_time):
             super().after_print_stats(frame, epoch_num, total_time)
             result = {"epoch": epoch_num, "max_epochs": self.algo.max_epochs,
-                      "elapsed_s": round(total_time, 2)}
+                      "elapsed_s": round(total_time, 2),
+                      "mean_reward": self.algo._mean_training_reward, "reward_unit": "per_step"}
+            self.writer.add_scalar("Train/mean_reward", result["mean_reward"], epoch_num)
+            self.writer.add_scalar("Train/mean_reward_per_step", result["mean_reward"], epoch_num)
             if self.algo.game_rewards.current_size > 0:
                 reward = float(self.algo._get_mean_rewards().mean())
                 length = float(self.algo.game_lengths.get_mean())
-                result.update(mean_reward=reward, mean_episode_length=length,
+                result.update(env_episode_return=reward, mean_episode_length=length,
                               survival_s=round(length * self.algo.vec_env.env.task.dt, 3))
-                self.writer.add_scalar("Train/mean_reward", reward, epoch_num)
+                self.writer.add_scalar("Env/mean_episode_return", reward, epoch_num)
                 self.writer.add_scalar("Train/mean_episode_length", length, epoch_num)
             self._last_summary = result
             self._last_termination_counts = {
@@ -173,17 +176,14 @@ def main():
                 if key in train_info:
                     metrics[label] = mean_metric(train_info[key])
             summary = self._last_summary
-            if "mean_reward" in summary:
-                metrics.update({"Mean reward (env return)": summary["mean_reward"],
-                                "Mean episode length (steps)": summary["mean_episode_length"],
+            metrics["Mean reward (training, per step)"] = summary["mean_reward"]
+            if "mean_episode_length" in summary:
+                metrics.update({"Mean episode length (steps)": summary["mean_episode_length"],
                                 "Mean episode duration (s)": summary["survival_s"]})
-            task_reward = mean_metric(self.algo.experience_buffer.tensor_dict["rewards"])
             disc_reward = mean_metric(train_info["disc_rewards"])
             enc_reward = mean_metric(train_info["enc_rewards"]) if "enc_rewards" in train_info else 0.0
             reward_prefix = args.algorithm.upper() + "_Reward/"
             metrics.update({
-                reward_prefix + "combined_per_step": self.algo._task_reward_w * task_reward
-                    + self.algo._disc_reward_w * disc_reward + getattr(self.algo, "_enc_reward_w", 0.0) * enc_reward,
                 reward_prefix + "discriminator": disc_reward,
                 "PPO/learning_rate": self.algo.last_lr,
                 "PPO/clip_fraction": mean_metric(train_info["actor_clip_frac"]),

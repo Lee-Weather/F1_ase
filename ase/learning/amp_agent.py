@@ -607,6 +607,10 @@ class AMPAgent(common_agent.CommonAgent):
 
     def _log_train_info(self, train_info, frame):
         super()._log_train_info(train_info, frame)
+        # Report the same combined rewards used for returns/advantages. Raw
+        # humanoid environment returns are constant-one rewards, hence lengths.
+        task_rewards = a2c_common.swap_and_flatten01(self.experience_buffer.tensor_dict['rewards'])
+        self._mean_training_reward = self._combine_rewards(task_rewards, train_info).mean().item()
 
         self.writer.add_scalar('losses/disc_loss', torch_ext.mean_list(train_info['disc_loss']).item(), frame)
 
