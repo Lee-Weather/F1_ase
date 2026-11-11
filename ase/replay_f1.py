@@ -2,7 +2,7 @@
 
 Example: python ase/replay_f1.py --engine mujoco --checkpoint MODEL --output DIR
 Both engines use the same deterministic actor, latent seeds and initial states.
-Outputs are one two-view video and one CSV per engine; no exported model needed.
+Outputs are one two-view video and one CSV per engine.
 """
 import argparse
 import csv
@@ -69,11 +69,66 @@ def joint_names():
     return [j.get("name") for j in ET.parse(ASSET).iter("joint")]
 
 
-def initial_case(index, cfg, names):
+def export_actor_npz(checkpoint, destination):
+    """Export inference weights for hosts without a working PyTorch runtime."""
+    import torch
+    kwargs = {"weights_only": False} if "weights_only" in inspect.signature(torch.load).parameters else {}
+    ckpt = torch.load(str(checkpoint), map_location="cpu", **kwargs)
+    weights = {k[len("a2c_network."):]: v.detach().float().numpy()
+               for k, v in ckpt["model"].items()
+               if k.startswith("a2c_network.actor_mlp.") or k.startswith("a2c_network.mu.")}
+    weights.update(mean=ckpt["running_mean_std"]["running_mean"].float().numpy(),
+                   scale=np.sqrt(ckpt["running_mean_std"]["running_var"].float().numpy() + 1e-5),
+                   epoch=np.array(ckpt["epoch"]),
+                   control_config=np.array(json.dumps(checkpoint_control(ckpt))))
+    np.savez_compressed(destination, **weights)
+
+
+def load_actor_numpy(path):
+    """Same normalized deterministic AMP/ASE actor using float32 NumPy operations."""
+    with np.load(path, allow_pickle=False) as archive:
+        weights = {k: archive[k] for k in archive.files}
+    is_ase = "actor_mlp._style_dense.weight" in weights
+    amp_layers = sorted(int(k.split(".")[1]) for k in weights
+                        if k.startswith("actor_mlp.") and k.endswith(".weight") and k.split(".")[1].isdigit())
+
+    def linear(x, name):
+        return x @ weights[name + ".weight"].T + weights[name + ".bias"]
+
+    def actor(obs, latent):
+        hidden = np.clip((np.asarray(obs, dtype=np.float32) - weights["mean"]) / weights["scale"], -5, 5)
+        if is_ase:
+            style = np.maximum(linear(latent, "actor_mlp._style_mlp.0"), 0)
+            style = np.maximum(linear(style, "actor_mlp._style_mlp.2"), 0)
+            style = np.tanh(linear(style, "actor_mlp._style_dense"))
+            hidden = np.concatenate((hidden, style), axis=-1)
+            layers = ["actor_mlp._dense_layers." + str(i) for i in range(3)]
+        else:
+            layers = ["actor_mlp." + str(i) for i in amp_layers]
+        for name in layers:
+            hidden = np.maximum(linear(hidden, name), 0)
+        return np.clip(linear(hidden, "mu"), -1, 1)
+
+    actor.epoch = int(weights["epoch"])
+    actor.algorithm = "ASE" if is_ase else "AMP"
+    actor.control_config = json.loads(str(weights["control_config"]))
+    return actor
+
+
+def initial_case(index, cfg, names, motion_file=None):
     default = np.array([cfg["env"]["defaultJointPos"][n] for n in names])
     root = np.array([0., 0., cfg["env"]["initialHeight"], 1., 0., 0., 0.])  # wxyz
     state = dict(q=default, qd=np.zeros(29), root=root, velocity=np.zeros(6), init="default")
-    if 4 <= index < 8:
+    if motion_file is not None and index > 0:
+        with np.load(motion_file, allow_pickle=False) as d:
+            frame = int(((index - 1) % 4) * (len(d["joint_pos"]) - 1) / 4)
+            order = [d["joint_names"].tolist().index(n) for n in names]
+            root = np.r_[d["body_pos_w"][frame, 0], d["body_quat_w"][frame, 0]]
+            root[:2] = 0  # Recenter each reference state without changing its height or orientation.
+            state = dict(q=d["joint_pos"][frame, order].copy(), qd=d["joint_vel"][frame, order].copy(),
+                         root=root, velocity=np.r_[d["body_lin_vel_w"][frame, 0], d["body_ang_vel_w"][frame, 0]],
+                         init=motion_file.name + ":frame" + str(frame))
+    elif motion_file is None and 4 <= index < 8:
         folder = ROOT / "ase/data/motions/f1"
         entries = yaml.safe_load((folder / "dataset_f1.yaml").read_text())["motions"]
         motion = entries[(index - 4) * (len(entries) - 1) // 3]["file"]
@@ -331,20 +386,28 @@ def main():
     parser.add_argument("--engine", choices=("gym", "mujoco"), required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--cases", type=int, default=12)
+    parser.add_argument("--cases", type=int)
+    parser.add_argument("--motion-file", type=Path, help="Use default pose and four phases of this reference clip")
+    parser.add_argument("--policy-npz", type=Path, help="Use exported NumPy actor for local MuJoCo")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if args.cases is None:
+        args.cases = 5 if args.motion_file else 12
     if args.cases < 1:
         parser.error("cases must be positive")
     if args.engine == "gym":
+        if args.policy_npz:
+            parser.error("policy-npz is supported with mujoco only")
         import isaacgym  # Must precede torch.
-    import torch
-    torch.set_num_threads(4)
-    torch.manual_seed(args.seed)
+    if not args.policy_npz:
+        import torch
+        torch.set_num_threads(4)
+        torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
     cfg = yaml.safe_load((ROOT / "ase/data/cfg/humanoid_f1.yaml").read_text())
-    actor = load_actor(args.checkpoint, "cuda:0" if args.engine == "gym" else "cpu")
+    actor = (load_actor_numpy(args.policy_npz) if args.policy_npz else
+             load_actor(args.checkpoint, "cuda:0" if args.engine == "gym" else "cpu"))
     cfg["env"].update(actor.control_config)
     print("REPLAY_CONTROL " + json.dumps(actor.control_config), flush=True)
     names = joint_names()
@@ -359,19 +422,23 @@ def main():
                 "base_z", "local_vx", "local_vy", "yaw_rate", "tilt_rad", "done", "termination",
                 "action_rms", *["q_" + n for n in names]])
             for case in range(args.cases):
-                state = initial_case(case, cfg, names)
+                state = initial_case(case, cfg, names, args.motion_file)
                 obs = engine.reset(state)
                 mode = ("switching" if case >= 8 else "fixed") if actor.algorithm == "ASE" else "none"
                 latent = Latents(args.seed + case, mode == "switching")
                 origin = state["root"][:2].copy()
                 for step in range(cfg["env"]["episodeLength"] - 1):
-                    z = torch.as_tensor(latent.next(), device=engine.device).unsqueeze(0)
+                    z = latent.next()[None, :]
+                    if not args.policy_npz:
+                        z = torch.as_tensor(z, device=engine.device)
                     action = actor(obs, z)
+                    action_rms = (float(np.sqrt(np.mean(action ** 2))) if args.policy_npz else
+                                  float(action.square().mean().sqrt()))
                     obs, values, reasons, q = engine.step(action)
                     done = bool(reasons)
                     writer.writerow([stem, case, state["init"], mode, step + 1, (step+1)*engine.dt,
                                      *values, int(done), "+".join(reasons),
-                                     float(action.square().mean().sqrt()), *q])
+                                     action_rms, *q])
                     if step % 2 == 0 or done:
                         label = ("F1 " + actor.algorithm + " epoch" + str(actor.epoch) + " | " + stem + " | case " + str(case+1) + "/" + str(args.cases)
                                  + " | " + mode + " latent\n" + state["init"] + " | {:.2f}s | ".format((step+1)*engine.dt)
