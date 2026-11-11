@@ -92,7 +92,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
         start_time = time.time()
         total_time = 0
         rep_count = 0
-        self.frame = 0
+        self.frame = getattr(self, 'frame', 0)
         self.obs = self.env_reset()
         self.curr_frames = self.batch_size_envs
         
@@ -118,7 +118,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
                 scaled_play_time = train_info['play_time']
                 curr_frames = self.curr_frames
                 self.frame += curr_frames
-                if self.print_stats:
+                formatter = getattr(self.algo_observer, 'format_train_stats', None)
+                if self.print_stats and not callable(formatter):
                     fps_step = curr_frames / scaled_play_time
                     fps_total = curr_frames / scaled_time
                     print(f'fps step: {fps_step:.1f} fps total: {fps_total:.1f}')
@@ -129,6 +130,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
                 self._log_train_info(train_info, frame)
 
                 self.algo_observer.after_print_stats(frame, epoch_num, total_time)
+                if self.print_stats and callable(formatter):
+                    print(formatter(train_info, epoch_num, self.frame, total_time), flush=True)
                 
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self._get_mean_rewards()

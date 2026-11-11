@@ -5,6 +5,7 @@ Keeps the image's PyTorch/Isaac Gym and caches legacy ASE dependencies outside
 the platform's /workspace artifact scanner.
 """
 import argparse
+from collections import deque
 from importlib import metadata
 import json
 import os
@@ -21,6 +22,39 @@ PACKAGES = {
     "termcolor": "1.1.0", "PyYAML": "6.0.1", "gym-notices": "0.0.8",
     "tensorboard": "2.11.2", "psutil": "5.9.8", "setproctitle": "1.3.3",
 }
+
+
+def format_training_log(stats):
+    """Render measured iteration statistics without importing the simulator."""
+    def duration(seconds):
+        seconds = max(0, int(seconds))
+        return "{:02d}:{:02d}:{:02d}".format(seconds // 3600, seconds // 60 % 60, seconds % 60)
+
+    def row(label, value):
+        return "{:>43} {}".format(label + ":", value)
+
+    width = 88
+    lines = ["#" * width,
+             "Learning iteration {}/{}".format(stats["epoch"], stats["max_epochs"]).center(width),
+             row("Computation", "{:.0f} steps/s (collection: {:.3f}s, learning: {:.3f}s)".format(
+                 stats["fps"], stats["play_time"], stats["update_time"]))]
+    for label, value in stats["metrics"].items():
+        display = "{:.2e}".format(value) if label == "PPO/learning_rate" else "{:.4f}".format(value)
+        lines.append(row(label, display))
+    for name, count in stats["terminations"].items():
+        lines.append(row("Episode_Termination/" + name, "{} / rollout".format(count)))
+    lines += ["-" * width,
+              row("Total timesteps", str(stats["frame"])),
+              row("Iteration time", "{:.3f}s".format(stats["iteration_time"])),
+              row("Time elapsed", duration(stats["elapsed_s"])),
+              row("ETA", duration(stats["eta_s"]))]
+    return "\n".join(lines)
+
+
+def mean_metric(value):
+    values = value if isinstance(value, (list, tuple)) else [value]
+    return sum(float(v.detach().float().mean()) if hasattr(v, "detach") else float(v)
+               for v in values) / len(values)
 
 
 def prepare_dependencies(install):
@@ -58,6 +92,7 @@ def main():
     parser.add_argument("--max_iterations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_path", default="output")
+    parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
     args, extra = parser.parse_known_args()
     if args.max_iterations < 1 or args.num_envs < 1:
         parser.error("max_iterations and num_envs must be positive")
@@ -75,18 +110,77 @@ def main():
     import torch
 
     class CloudObserver(entry.RLGPUAlgoObserver):
+        def process_infos(self, infos, done_indices):
+            super().process_infos(infos, done_indices)
+            if not hasattr(self, "_termination_counts"):
+                self._termination_counts = {}
+            for name, mask in infos.get("termination_reasons", {}).items():
+                count = mask.sum().detach()
+                self._termination_counts[name] = self._termination_counts.get(name, 0) + count
+
         def after_print_stats(self, frame, epoch_num, total_time):
             super().after_print_stats(frame, epoch_num, total_time)
-            result = {"epoch": epoch_num, "max_epochs": args.max_iterations,
+            result = {"epoch": epoch_num, "max_epochs": self.algo.max_epochs,
                       "elapsed_s": round(total_time, 2)}
             if self.algo.game_rewards.current_size > 0:
                 reward = float(self.algo._get_mean_rewards().mean())
                 length = float(self.algo.game_lengths.get_mean())
                 result.update(mean_reward=reward, mean_episode_length=length,
-                              survival_s=round(length * 0.02, 3))
+                              survival_s=round(length * self.algo.vec_env.env.task.dt, 3))
                 self.writer.add_scalar("Train/mean_reward", reward, epoch_num)
                 self.writer.add_scalar("Train/mean_episode_length", length, epoch_num)
-            print("F1_TRAIN " + json.dumps(result), flush=True)
+            self._last_summary = result
+            self._last_termination_counts = {
+                name: int(count) for name, count in getattr(self, "_termination_counts", {}).items()
+            }
+            for name, count in self._last_termination_counts.items():
+                self.writer.add_scalar("Episode_Termination/" + name, count, frame)
+            self._termination_counts = {}
+
+        def format_train_stats(self, train_info, epoch_num, frame, total_time):
+            if not hasattr(self, "_iteration_times"):
+                self._iteration_times = deque(maxlen=20)
+            self._iteration_times.append(train_info["total_time"])
+            metrics = {}
+            sigmas = self.algo.experience_buffer.tensor_dict.get("sigmas")
+            if sigmas is not None:
+                metrics["Mean action noise std"] = mean_metric(sigmas)
+            for label, key in (("Mean value_function loss", "critic_loss"),
+                               ("Mean surrogate loss", "actor_loss"),
+                               ("Mean policy entropy", "entropy"),
+                               ("Mean bounds loss", "b_loss"),
+                               ("Mean discriminator loss", "disc_loss"),
+                               ("Mean encoder loss", "enc_loss")):
+                if key in train_info:
+                    metrics[label] = mean_metric(train_info[key])
+            summary = self._last_summary
+            if "mean_reward" in summary:
+                metrics.update({"Mean reward (env return)": summary["mean_reward"],
+                                "Mean episode length (steps)": summary["mean_episode_length"],
+                                "Mean episode duration (s)": summary["survival_s"]})
+            task_reward = mean_metric(self.algo.experience_buffer.tensor_dict["rewards"])
+            disc_reward = mean_metric(train_info["disc_rewards"])
+            enc_reward = mean_metric(train_info["enc_rewards"])
+            metrics.update({
+                "ASE_Reward/combined_per_step": self.algo._task_reward_w * task_reward
+                    + self.algo._disc_reward_w * disc_reward + self.algo._enc_reward_w * enc_reward,
+                "ASE_Reward/discriminator": disc_reward,
+                "ASE_Reward/encoder": enc_reward,
+                "PPO/learning_rate": self.algo.last_lr,
+                "PPO/clip_fraction": mean_metric(train_info["actor_clip_frac"]),
+            })
+            block = format_training_log({
+                "epoch": epoch_num, "max_epochs": self.algo.max_epochs, "frame": frame,
+                "fps": self.algo.curr_frames / train_info["total_time"],
+                "play_time": train_info["play_time"], "update_time": train_info["update_time"],
+                "iteration_time": train_info["total_time"], "elapsed_s": total_time,
+                "eta_s": max(0, self.algo.max_epochs - epoch_num)
+                    * sum(self._iteration_times) / len(self._iteration_times),
+                "metrics": metrics, "terminations": self._last_termination_counts,
+            })
+            if args.json_logs:
+                block += "\nF1_TRAIN " + json.dumps(summary)
+            return block
 
     entry.RLGPUAlgoObserver = CloudObserver
     print("F1_RUNTIME " + json.dumps({

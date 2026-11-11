@@ -112,11 +112,20 @@ class HumanoidF1(HumanoidAMP):
         # the floor. Base height and tilt still terminate independently.
         bad_contact = ((contact.norm(dim=-1) > self.cfg["env"]["terminationContactForce"]) &
                        (self._rigid_body_pos[:, :, 2] < self.cfg["env"]["terminationContactHeight"])).any(dim=-1)
-        fallen = ((self._rigid_body_pos[:, 0, 2] < self.cfg["env"]["terminationHeight"]) |
-                  (tilt > self.cfg["env"]["terminationTilt"]) | bad_contact)
-        fallen &= (self.progress_buf > 1) & self._enable_early_termination
+        base_low = self._rigid_body_pos[:, 0, 2] < self.cfg["env"]["terminationHeight"]
+        base_tilt = tilt > self.cfg["env"]["terminationTilt"]
+        eligible = (self.progress_buf > 1) & self._enable_early_termination
+        fallen = (base_low | base_tilt | bad_contact) & eligible
+        time_out = self.progress_buf >= self.max_episode_length - 1
         self._terminate_buf[:] = fallen.long()
-        self.reset_buf[:] = (fallen | (self.progress_buf >= self.max_episode_length - 1)).long()
+        self.reset_buf[:] = (fallen | time_out).long()
+        # Telemetry only; one episode can have multiple simultaneous reasons.
+        self.extras["termination_reasons"] = {
+            "time_out": time_out,
+            "base_height": base_low & eligible,
+            "base_tilt": base_tilt & eligible,
+            "illegal_ground_contact": bad_contact & eligible,
+        }
 
     def _build_amp_observations(self, root_pos, root_rot, root_vel, root_ang_vel,
                                 dof_pos, dof_vel, key_body_pos, *unused):
