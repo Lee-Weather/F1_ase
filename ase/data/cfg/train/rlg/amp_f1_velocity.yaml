@@ -1,6 +1,6 @@
 # Velocity-conditioned AMP: task-dominant stand/walk/stop, no latent or encoder.
 params:
-  seed: -1
+  seed: 42
   algo:
     name: amp
   model:
