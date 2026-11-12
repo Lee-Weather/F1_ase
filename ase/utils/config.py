@@ -55,6 +55,10 @@ def load_cfg(args):
         cfg_train = yaml.load(f, Loader=yaml.SafeLoader)
 
     cfg = load_env_config(os.path.join(os.getcwd(), args.cfg_env))
+    if getattr(args, "velocity_stage", None) is not None:
+        if args.task != "HumanoidF1Velocity":
+            raise ValueError("--velocity_stage requires HumanoidF1Velocity")
+        cfg["env"]["velocityStageOverride"] = args.velocity_stage
 
     # Override number of environments if passed on the command line
     if args.num_envs > 0:
@@ -157,6 +161,8 @@ def parse_sim_params(args, cfg, cfg_train):
 
 def get_args(benchmark=False):
     custom_parameters = [
+        {"name": "--velocity_stage", "type": str, "default": None,
+            "choices": ["A", "B", "C"], "help": "Explicit velocity curriculum stage, including on resume"},
         {"name": "--test", "action": "store_true", "default": False,
             "help": "Run trained policy, no training"},
         {"name": "--play", "action": "store_true", "default": False,

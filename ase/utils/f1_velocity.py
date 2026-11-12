@@ -43,6 +43,21 @@ def velocity_settings(env):
         low, high = settings[key]
         if not 0 < low <= high:
             raise ValueError("Invalid " + key)
+    if settings.get("version", 1) == 2:
+        if not 0 <= settings["encoderMotionZeroSpeed"] < settings["encoderMotionFullSpeed"]:
+            raise ValueError("Encoder motion thresholds are inconsistent")
+        if settings["progressWindowSeconds"] <= 0:
+            raise ValueError("Progress window must be positive")
+        if not 0 < settings["standPose"]["centralFraction"] <= 1:
+            raise ValueError("Standing reference centralFraction must be in (0, 1]")
+        if not np.isclose(np.linalg.norm(settings["footForwardAxis"]), 1):
+            raise ValueError("Foot forward axis must be a unit vector")
+        for stage in settings["curriculum"].values():
+            low, high = stage["movingSpeed"]
+            if not settings["minMovingSpeed"] <= low <= high <= settings["maxSpeed"]:
+                raise ValueError("Curriculum speed outside command range")
+            if not 0 <= stage["referenceProbability"] <= 1:
+                raise ValueError("Invalid reference initialization probability")
     return settings
 
 
@@ -67,6 +82,31 @@ def encoder_command_mask(commands, settings):
     return _clip((abs(commands[..., 0]) - low) / (high - low), 0.0, 1.0)
 
 
+def encoder_motion_mask(commands, forward_speed, history_valid, settings):
+    """A transition gate shared by encoder reward and encoder minibatch loss."""
+    low, high = settings["encoderMotionZeroSpeed"], settings["encoderMotionFullSpeed"]
+    return (encoder_command_mask(commands, settings) * history_valid
+            * _clip((forward_speed - low) / (high - low), 0.0, 1.0))
+
+
+def foot_geometry(root_rotation, foot_rotation, forward_axis):
+    """Signed foot heading in the root's horizontal frame; sole tilt to world Z."""
+    import torch
+    from isaacgym.torch_utils import quat_rotate
+    from utils import torch_utils
+    forward = torch.zeros_like(foot_rotation[..., :3])
+    forward[:] = torch.as_tensor(forward_axis, device=forward.device)
+    direction = quat_rotate(foot_rotation.reshape(-1, 4), forward.reshape(-1, 3))
+    heading = torch_utils.calc_heading_quat_inv(root_rotation)
+    heading = heading[:, None, :].expand_as(foot_rotation).reshape(-1, 4)
+    direction = quat_rotate(heading, direction).reshape_as(forward)
+    yaw = torch.atan2(direction[..., 1], direction[..., 0])
+    up = torch.zeros_like(forward)
+    up[..., 2] = 1
+    up = quat_rotate(foot_rotation.reshape(-1, 4), up.reshape(-1, 3)).reshape_as(up)
+    return yaw, torch.acos(up[..., 2].clamp(-1, 1))
+
+
 def masked_mean(values, mask):
     """Differentiable weighted mean, including an all-standing minibatch."""
     mask = mask.reshape(values.shape).to(dtype=values.dtype)
@@ -74,7 +114,8 @@ def masked_mean(values, mask):
 
 
 def task_rewards(velocity, yaw_rate, tilt, leg_velocity, foot_speed, action,
-                 previous_action, torque, effort, joint_pos, lower, upper, commands, settings):
+                 previous_action, torque, effort, joint_pos, lower, upper, commands, settings,
+                 posture=None):
     """Privileged quantities are used for rewards only, never actor inputs."""
     import torch
     weights = settings["rewardWeights"]
@@ -93,11 +134,34 @@ def task_rewards(velocity, yaw_rate, tilt, leg_velocity, foot_speed, action,
         "torque": -(torque / effort.clamp_min(1)).square().mean(-1),
         "joint_limits": -outside.square().mean(-1),
     }
+    if settings.get("version", 1) == 2:
+        if posture is None:
+            raise ValueError("Velocity v2 requires foot geometry and PD targets")
+        radians = np.pi / 180
+        components.update({
+            "lin_vel_tracking": 1 / (1 + ((velocity[:, 0] - commands[:, 0]) / settings["trackingSigma"]).square()),
+            "lateral_tracking": -(velocity[:, 1] / settings["lateralSigma"]).square(),
+            "yaw_tracking": -(yaw_rate / settings["yawSigma"]).square(),
+            "upright": -(tilt / settings["tiltSigma"]).square(),
+            "stand_quiet": stop_gate * quiet * torch.exp(-posture["stand_pose_error"]),
+            "foot_heading": -((posture["foot_yaw"].abs() - settings["footHeadingToleranceDeg"] * radians).clamp_min(0)
+                               / (settings["footHeadingScaleDeg"] * radians)).square().mean(-1),
+            "hip_yaw": -((posture["hip_yaw"].abs() - settings["hipYawToleranceDeg"] * radians).clamp_min(0)
+                          / (settings["hipYawScaleDeg"] * radians)).square().mean(-1),
+            "stance_foot_tilt": -(((posture["foot_tilt"] - settings["stanceTiltToleranceDeg"] * radians).clamp_min(0)
+                                    / (settings["stanceTiltScaleDeg"] * radians)).square()
+                                  * posture["stance"]).mean(-1),
+        })
+        target = posture["pd_targets"]
+        target_outside = (target - torch.max(lower, torch.min(target, upper))) / (upper - lower).clamp_min(1e-3)
+        components["joint_limits"] -= target_outside.square().mean(-1)
     weighted = {key: weights[key] * value for key, value in components.items()}
     return sum(weighted.values()), weighted
 
 
 def scripted_speed(seconds, profile="walk-stop"):
+    if profile == "walk":
+        return 0.0 if seconds < .5 else .5
     schedule = ([(5, 0), (13, .3), (21, .6), (29, .8), (35, .3), (45, 0)]
                 if profile == "walk-stop" else
                 [(5, 0), (13, .6), (23, 0), (33, .3), (45, 0)])
@@ -110,7 +174,7 @@ def scripted_speed(seconds, profile="walk-stop"):
 def policy_spec(settings, dt, motion_file):
     """Versioned deployment-relevant schema stored with the trained policy."""
     return {
-        "version": 1, "task": "HumanoidF1Velocity", "actor_obs": 96, "critic_obs": 451,
+        "version": settings.get("version", 1), "task": "HumanoidF1Velocity", "actor_obs": 96, "critic_obs": 451,
         "amp_obs": 890, "actions": 29, "latent_dim": 32, "latent_hold_episode": True,
         "actor_fields": [["base_ang_vel", 3], ["projected_gravity", 3],
                          ["joint_pos_rel", 29], ["joint_vel", 29], ["last_action", 29],

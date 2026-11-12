@@ -3,17 +3,63 @@ base: humanoid_f1.yaml
 env:
   episodeLength: 1500
   hybridInitProb: 0.3
+  # Policy target windows in radians; physical URDF limits and PD gains unchanged.
+  pdTargetLimits:
+    left_hip_yaw_joint: [-0.6981317, 0.6981317]
+    right_hip_yaw_joint: [-0.6981317, 0.6981317]
   velocityTask:
+    version: 2
     maxSpeed: 0.8
     minMovingSpeed: 0.2
     deadzone: 0.05
     acceleration: 0.3
     deceleration: 0.5
-    standDuration: [2.5, 4.0]
-    walkDuration: [4.0, 6.0]
+    standDuration: [3.0, 5.0]
+    walkDuration: [6.0, 10.0]
     encoderZeroSpeed: 0.05
     encoderFullSpeed: 0.15
-    trackingSigma: 0.2
+    encoderMotionZeroSpeed: 0.05
+    encoderMotionFullSpeed: 0.15
+    progressWindowSeconds: 0.2
+    encoderMaskRule: history_valid_times_command_gate_times_forward_displacement_gate
+    footForwardAxis: [1.0, 0.0, 0.0]
+    footHeadingToleranceDeg: 30.0
+    footHeadingScaleDeg: 30.0
+    hipYawToleranceDeg: 35.0
+    hipYawScaleDeg: 20.0
+    stanceTiltToleranceDeg: 10.0
+    stanceTiltScaleDeg: 30.0
+    stanceContactForce: 5.0
+    stanceMaxHeight: 0.12
+    standPose:
+      motion: A1_stand_weichai_f1_29.npz
+      # Median of the middle half; a reward target only, not the control neutral.
+      centralFraction: 0.5
+      legSigma: 0.35
+      upperSigma: 0.7
+      upperWeight: 0.2
+    curriculum:
+      A:
+        referenceProbability: 0.7
+        referenceMotion: B3_walk1_weichai_f1_29.npz
+        movingSpeed: [0.4, 0.6]
+        initialStandDuration: [0.3, 0.5]
+        continuousWalk: true
+        retarget: false
+      B:
+        referenceProbability: 0.3
+        movingSpeed: [0.3, 0.6]
+        initialStandDuration: [3.0, 5.0]
+        continuousWalk: false
+        retarget: true
+      C:
+        referenceProbability: 0.3
+        movingSpeed: [0.2, 0.8]
+        initialStandDuration: [3.0, 5.0]
+        continuousWalk: false
+        retarget: true
+    retargetSteadySeconds: 2.0
+    trackingSigma: 0.3
     lateralSigma: 0.15
     yawSigma: 0.3
     tiltSigma: 0.35
@@ -21,11 +67,14 @@ env:
     quietFootSigma: 0.08
     stopSpeedGate: 0.15
     rewardWeights:
-      lin_vel_tracking: 1.0
-      lateral_tracking: 0.3
-      yaw_tracking: 0.2
-      upright: 0.2
+      lin_vel_tracking: 2.0
+      lateral_tracking: 0.1
+      yaw_tracking: 0.1
+      upright: 0.1
       stand_quiet: 0.3
       action_rate: 0.02
       torque: 0.01
-      joint_limits: 0.01
+      joint_limits: 0.2
+      foot_heading: 0.15
+      hip_yaw: 0.1
+      stance_foot_tilt: 0.05

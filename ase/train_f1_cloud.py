@@ -94,6 +94,8 @@ def main():
     parser.add_argument("--output_path", default="output")
     parser.add_argument("--algorithm", choices=("ase", "amp"), default="ase")
     parser.add_argument("--task", choices=("HumanoidF1", "HumanoidF1Velocity"), default="HumanoidF1")
+    parser.add_argument("--velocity-stage", choices=("A", "B", "C"),
+                        help="Select a curriculum stage explicitly; otherwise resume the saved stage or start A")
     parser.add_argument("--cfg-env", help="Environment YAML; defaults to the selected F1 task")
     parser.add_argument("--cfg-train", help="Training YAML; defaults to the selected task/algorithm")
     parser.add_argument("--motion-file", help="Reference NPZ or YAML; defaults to the selected F1 task")
@@ -101,11 +103,13 @@ def main():
     args, extra = parser.parse_known_args()
     velocity_task = args.task == "HumanoidF1Velocity"
     if args.max_iterations is None:
-        args.max_iterations = 1000 if velocity_task else 200
+        args.max_iterations = 500 if velocity_task else 200
     if args.max_iterations < 1 or args.num_envs < 1:
         parser.error("max_iterations and num_envs must be positive")
     if velocity_task and args.algorithm != "ase":
         parser.error("HumanoidF1Velocity requires --algorithm ase")
+    if args.velocity_stage is not None and not velocity_task:
+        parser.error("--velocity-stage requires HumanoidF1Velocity")
     args.cfg_env = args.cfg_env or ("ase/data/cfg/humanoid_f1_velocity.yaml" if velocity_task else
                                      "ase/data/cfg/humanoid_f1.yaml")
     args.cfg_train = args.cfg_train or ("ase/data/cfg/train/rlg/ase_f1_velocity.yaml" if velocity_task else
@@ -242,6 +246,7 @@ def main():
         "seed": args.seed, "control_hz": 50,
         "algorithm": args.algorithm, "motion_file": args.motion_file,
         "task": args.task, "cfg_env": args.cfg_env, "cfg_train": args.cfg_train,
+        "velocity_stage_override": args.velocity_stage,
     }), flush=True)
     sys.argv = [
         str(ROOT / "ase/run.py"), "--task", args.task, "--headless",
@@ -251,7 +256,7 @@ def main():
         "--motion_file", args.motion_file,
         "--num_envs", str(args.num_envs), "--max_iterations", str(args.max_iterations),
         "--seed", str(args.seed), "--output_path", args.output_path,
-        *extra,
+        *(["--velocity_stage", args.velocity_stage] if args.velocity_stage is not None else []), *extra,
     ]
     entry.main()
 

@@ -3,7 +3,7 @@ import numpy as np
 
 
 LEGACY_CONTROL = {"actionMapping": "default_offset", "actionScale": 0.5}
-CONTROL_KEYS = ("actionMapping", "actionScale", "actionLimitMargin", "defaultJointPos",
+CONTROL_KEYS = ("actionMapping", "actionScale", "actionLimitMargin", "pdTargetLimits", "defaultJointPos",
                 "pdGains", "armature", "controlFrequencyInv")
 
 
@@ -21,11 +21,17 @@ def pd_action_parameters(env, names, lower, upper):
         return neutral, scale, scale.copy()
     if mode != "joint_limits":
         raise ValueError("Unknown F1 actionMapping: " + str(mode))
-    lower, upper = np.asarray(lower, dtype=np.float32), np.asarray(upper, dtype=np.float32)
+    lower, upper = np.array(lower, dtype=np.float32, copy=True), np.array(upper, dtype=np.float32, copy=True)
     margin = float(env.get("actionLimitMargin", 0.1))
     if margin < 0 or (upper <= lower).any() or (neutral < lower - 1e-5).any() or (neutral > upper + 1e-5).any():
         raise ValueError("Invalid joint limits, default posture or actionLimitMargin")
     extra = margin * (upper - lower)
+    for name, limits in env.get("pdTargetLimits", {}).items():
+        index = names.index(name)
+        low, high = map(float, limits)
+        if not lower[index] <= low < neutral[index] < high <= upper[index]:
+            raise ValueError("Invalid PD target window for " + name)
+        lower[index], upper[index], extra[index] = low, high, 0
     negative, positive = neutral - lower + extra, upper - neutral + extra
     if (negative <= 0).any() or (positive <= 0).any():
         raise ValueError("Both action directions require positive scales")
@@ -45,4 +51,8 @@ def targets_to_actions(target, neutral, negative, positive):
 
 def checkpoint_control(checkpoint):
     # Pre-mapping-fix models were all trained with default_offset and scale 0.5.
-    return checkpoint.get("control_config", LEGACY_CONTROL).copy()
+    control = checkpoint.get("control_config", LEGACY_CONTROL).copy()
+    # A missing window means the original full-travel mapping, even when the
+    # replay YAML now defines a narrower window for newly trained policies.
+    control.setdefault("pdTargetLimits", {})
+    return control

@@ -17,7 +17,7 @@ import yaml
 
 ASE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ASE))
-from utils.f1_velocity import (encoder_command_mask, load_env_config, masked_mean,
+from utils.f1_velocity import (encoder_command_mask, encoder_motion_mask, load_env_config, masked_mean,
                                policy_spec, ramp_commands, scripted_speed, task_rewards,
                                velocity_settings)
 
@@ -30,6 +30,8 @@ class VelocityControlTests(unittest.TestCase):
         cls.settings = velocity_settings(cls.env["env"])
 
     def test_command_ramp_matches_numpy_and_stops(self):
+        self.assertEqual(scripted_speed(.49, "walk"), 0)
+        self.assertEqual(scripted_speed(14.0, "walk"), .5)
         current = np.zeros((2, 3), dtype=np.float32)
         tensor = torch.from_numpy(current.copy())
         for step in range(2250):
@@ -56,21 +58,72 @@ class VelocityControlTests(unittest.TestCase):
         zero.backward()
         self.assertEqual(zero.item(), 0)
         self.assertTrue(torch.equal(empty.grad, torch.zeros_like(empty)))
+        # A moving command or a brief/invalid motion history alone cannot open it.
+        forward = torch.tensor([0., .15, .15])
+        actual = encoder_motion_mask(commands, forward, torch.tensor([True, False, True]), self.settings)
+        torch.testing.assert_close(actual, torch.tensor([0., 0., 1.]))
+        self.assertEqual(encoder_motion_mask(commands, torch.zeros(3), torch.ones(3), self.settings).sum(), 0)
 
     def test_tracking_and_stand_rewards_have_correct_targets(self):
         velocity = torch.tensor([[0., 0, 0], [.6, 0, 0], [0., 0, 0], [.6, 0, 0]])
         commands = torch.tensor([[0., 0, 0], [.6, 0, 0], [.6, 0, 0], [0., 0, 0]])
         zeros = torch.zeros(4)
         joints = torch.zeros(4, 29)
+        posture = dict(foot_yaw=torch.zeros(4, 2), hip_yaw=torch.zeros(4, 2), foot_tilt=torch.zeros(4, 2),
+                       stance=torch.ones(4, 2), stand_pose_error=zeros, pd_targets=joints)
         reward, terms = task_rewards(velocity, zeros, zeros, torch.zeros(4, 12), torch.zeros(4, 2),
             joints, joints, joints, torch.ones(29), joints, -torch.ones(29), torch.ones(29),
-            commands, self.settings)
+            commands, self.settings, posture)
         self.assertGreater(reward[1].item(), reward[2].item())
         self.assertGreater(reward[0].item(), reward[3].item())
         self.assertGreater(terms["stand_quiet"][0].item(), 0)
         self.assertEqual(terms["stand_quiet"][3].item(), 0)
         torch.testing.assert_close(reward, sum(terms.values()))
         self.assertTrue(torch.isfinite(reward).all())
+        # 90-degree feet are worse at identical speed and commands; a foot in
+        # flight is not punished for sole tilt. Limit cost also sees PD targets.
+        posture["foot_yaw"][:] = np.pi / 2
+        posture["foot_tilt"][:] = np.pi / 2
+        posture["stance"][:] = 0
+        posture["pd_targets"] = torch.full_like(joints, 2)
+        sideways, costs = task_rewards(velocity, zeros, zeros, torch.zeros(4, 12), torch.zeros(4, 2),
+            joints, joints, joints, torch.ones(29), joints, -torch.ones(29), torch.ones(29),
+            commands, self.settings, posture)
+        self.assertTrue((sideways < reward).all())
+        self.assertTrue((costs["foot_heading"] < 0).all())
+        self.assertTrue((costs["joint_limits"] < 0).all())
+        self.assertTrue(costs["stance_foot_tilt"].eq(0).all())
+        self.assertAlmostEqual(float(terms["lin_vel_tracking"][2]), .4, places=5)
+
+    def test_target_windows_cover_references_and_legacy_mapping(self):
+        import xml.etree.ElementTree as ET
+        from replay_f1 import joint_names
+        from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control
+        names = joint_names()
+        path = ASE / "data/assets/f1/urdf/f1_29dof.urdf"
+        joints = {joint.get("name"): joint.find("limit") for joint in ET.parse(path).getroot().findall("joint")}
+        lower = np.array([float(joints[name].get("lower")) for name in names], dtype=np.float32)
+        upper = np.array([float(joints[name].get("upper")) for name in names], dtype=np.float32)
+        original = lower.copy(), upper.copy()
+        neutral, negative, positive = pd_action_parameters(self.env["env"], names, lower, upper)
+        folder = ASE / "data/motions/f1"
+        entries = yaml.safe_load((folder / "dataset_f1_walk_stop.yaml").read_text())["motions"]
+        for name, limits in self.env["env"]["pdTargetLimits"].items():
+            index = names.index(name)
+            self.assertAlmostEqual(float(action_to_targets(-np.ones(29), neutral, negative, positive)[index]), limits[0], places=6)
+            self.assertAlmostEqual(float(action_to_targets(np.ones(29), neutral, negative, positive)[index]), limits[1], places=6)
+            for entry in entries:
+                with np.load(folder / entry["file"]) as data:
+                    q = data["joint_pos"][:, data["joint_names"].tolist().index(name)]
+                    self.assertGreaterEqual(float(q.min()), limits[0])
+                    self.assertLessEqual(float(q.max()), limits[1])
+        np.testing.assert_array_equal(lower, original[0])
+        np.testing.assert_array_equal(upper, original[1])
+        old_env = dict(self.env["env"], **checkpoint_control({"control_config": {"actionMapping": "joint_limits"}}))
+        old = pd_action_parameters(old_env, names, lower, upper)
+        hip = names.index("left_hip_yaw_joint")
+        self.assertGreater(float(action_to_targets(np.ones(29), *old)[hip]), 1.57)
+        self.assertEqual(checkpoint_control({})["pdTargetLimits"], {})
 
     def test_configuration_inherits_control_and_reuses_motions(self):
         baseline = load_env_config(ASE / "data/cfg/humanoid_f1.yaml")
@@ -115,7 +168,7 @@ class VelocityControlTests(unittest.TestCase):
         spec = policy_spec(self.settings, .02, "ase/data/motions/f1/dataset_f1_walk_stop.yaml")
         self.assertEqual(spec["actor_obs"], 96)
         self.assertEqual(sum(size for _, size in spec["actor_fields"]), 96)
-        control = {name: self.env["env"][name] for name in ("actionMapping", "pdGains", "defaultJointPos")}
+        control = {name: self.env["env"][name] for name in ("actionMapping", "pdGains", "defaultJointPos", "pdTargetLimits")}
         checkpoint = dict(epoch=0, frame=0, control_config=control, policy_config=spec,
             running_mean_std={"running_mean": torch.zeros(96), "running_var": torch.ones(96)},
             model={"a2c_network."+name: tensor.detach() for name, tensor in net.state_dict().items()})
@@ -169,7 +222,8 @@ class VelocityControlTests(unittest.TestCase):
                 self.motor_efforts = self.dof_limits_upper = torch.ones(29)
                 self.dof_limits_lower = -torch.ones(29)
                 self.rew_buf = torch.zeros(2)
-                self.progress_buf = self._terminate_buf = torch.zeros(2, dtype=torch.long)
+                self.progress_buf = torch.zeros(2, dtype=torch.long)
+                self._terminate_buf = torch.zeros(2, dtype=torch.long)
                 self.extras = {}
 
             def _setup_character_props(self, bodies):
@@ -206,9 +260,13 @@ class VelocityControlTests(unittest.TestCase):
         modules = {"env.tasks.humanoid_f1": base, "isaacgym": types.ModuleType("isaacgym"),
                    "isaacgym.torch_utils": rotations, "utils.torch_utils": types.ModuleType("utils.torch_utils")}
         module_name = "env.tasks.humanoid_f1_velocity"
+        # Preserve the v1 timing contract too. v2 physical displacement and
+        # curriculum timing are covered by the small real-Gym smoke check.
+        legacy = deepcopy(self.env)
+        legacy["env"]["velocityTask"].pop("version")
         with mock.patch.dict(sys.modules, modules):
             module = importlib.import_module(module_name)
-            task = module.HumanoidF1Velocity(deepcopy(self.env), None, None, "cpu", 0, True)
+            task = module.HumanoidF1Velocity(legacy, None, None, "cpu", 0, True)
         sys.modules.pop(module_name, None)
         task._motion_state = lambda: (torch.zeros(2, 3), torch.zeros(2), torch.zeros(2), torch.zeros(2, 2))
         task._reset_envs(torch.arange(2))

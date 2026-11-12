@@ -88,7 +88,7 @@ class HumanoidF1(HumanoidAMP):
 
     def validate_control_config(self, saved):
         for key, value in checkpoint_control({"control_config": saved} if saved is not None else {}).items():
-            if self.cfg["env"].get(key) != value:
+            if self.cfg["env"].get(key, {} if key == "pdTargetLimits" else None) != value:
                 raise ValueError("Checkpoint control mismatch for " + key + "; start a fresh training run")
 
     def _build_termination_heights(self):

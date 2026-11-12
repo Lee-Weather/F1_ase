@@ -126,29 +126,58 @@ the privileged critic has 451 inputs. The actor does not receive simulated base
 linear velocity or reference frames. Lateral/yaw commands are reserved at zero.
 
 The environment extends `humanoid_f1.yaml`, retaining the asset, PD gains and
-joint-limit action mapping. Its five-clip reference list reuses existing standing,
-walking and transition NPZs. Commands alternate between standing and walking at
-0.2–0.8 m/s, with acceleration/deceleration limits of 0.3/0.5 m/s². Encoder rewards
-and losses are masked around zero command and during initial history warmup.
-Task/discriminator/encoder reward weights start at 1.0/0.3/0.05.
+joint-limit action mapping. Version 2 limits policy PD targets for both hip yaw
+joints to ±40 degrees, without changing physical limits or adding PD margin to
+these two channels. The same five NPZs train the discriminator. Foot heading,
+hip yaw, stance sole tilt and out-of-range PD targets have soft costs. Forward
+tracking uses `1 / (1 + ((vx-command)/0.3)^2)`; lateral/yaw/tilt deviations are
+costs. Quiet standing also favors the middle-half median posture of A1.
+
+Task/discriminator/encoder weights remain 1.0/0.3/0.05. Encoder reward and loss
+use the same transition mask: valid history × command gate × forward-motion
+gate. Motion is measured from 0.2 seconds of root displacement, with a 0.05–0.15
+m/s gate; it is used only for rewards/losses/diagnostics. Commands retain
+acceleration/deceleration limits of 0.3/0.5 m/s².
+
+Curriculum A starts 70% of episodes from B3 and 30% from the default posture;
+default starts wait 0.3–0.5 seconds, then request 0.4–0.6 m/s continuously.
+Reference starts match their initial forward speed before ramping to a target.
+Stage B uses 70% default starts, all five reference initializations and
+stand/walk/restart at 0.3–0.6 m/s. Stage C expands walking to 0.2–0.8 m/s.
+Walking/standing segments last 6–10/3–5 seconds; a mid-walk retarget waits until
+the current command reaches its target and stays there for two seconds.
+Stages advance explicitly after replay review, never automatically by epoch.
 
 After simulation validation and training authorization, run from the repository root:
 
 ```bash
-python ase/train_f1_cloud.py --task HumanoidF1Velocity --algorithm ase --num_envs 4096 --max_iterations 1000 --seed 42
+python ase/train_f1_cloud.py --task HumanoidF1Velocity --algorithm ase --num_envs 4096 --max_iterations 500 --velocity-stage A --seed 42
 ```
 
 The entry selects the velocity environment, training configuration and motion list.
 `--cfg-env`, `--cfg-train` and `--motion-file` allow explicit overrides. Old F1 AMP/ASE
 defaults remain available under `--task HumanoidF1`. Velocity checkpoints contain
 the observation schema, command settings and control metadata; they cannot be
-resumed as the old 93-input task.
+resumed as the old 93-input task. The default pilot budget is 500 iterations.
+The checkpoint also stores curriculum stage separately from the immutable policy
+schema. Resume restores that stage; `--velocity-stage B` or `C` explicitly
+overrides it. Start v2 from scratch, rather than resuming a failed v1 policy.
+Replay accepts v1/v2 metadata and restores the saved control window; a missing
+window means the original mapping, so legacy policies do not inherit ±40°.
+
+For stage A, first review three default-posture, zero-initial-speed cases at
+0.5 m/s for 15 seconds (at least ten seconds of sustained correct stepping is
+required before advancing):
+
+```bash
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model_500.pt --output /path/to/czy/data/exp_f1_5 --command-profile walk --duration 15 --cases 3
+```
 
 Once a velocity model exists, replay the continuous 45-second stand/walk/stop
 sequence in Isaac Gym (replace paths with the actual checkpoint/archive location):
 
 ```bash
-python ase/replay_f1.py --engine gym --checkpoint /path/to/model_1000.pt --output /path/to/czy/data/exp_f1_4 --command-profile walk-stop --cases 3
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model.pt --output /path/to/czy/data/exp_f1_5 --command-profile walk-stop --cases 3
 ```
 
 `--command-profile restart` checks a second start after stopping. Use `--cases 10
@@ -161,7 +190,7 @@ Interactive input is optional and uses [pygame joystick](https://www.pygame.org/
 (`pygame>=2` is needed only for this mode):
 
 ```bash
-python ase/replay_f1.py --engine gym --checkpoint /path/to/model_1000.pt --output /path/to/czy/data/exp_f1_4 --command-profile joystick --viewer --no-video --cases 1 --duration 60
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model.pt --output /path/to/czy/data/exp_f1_5 --command-profile joystick --viewer --no-video --cases 1 --duration 60
 ```
 
 The default axis is 1, negative direction for forward; `--axis`, `--axis-sign`,

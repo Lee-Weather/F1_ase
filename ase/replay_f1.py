@@ -116,7 +116,7 @@ def load_actor_numpy(path):
 
     actor.epoch = int(weights["epoch"])
     actor.algorithm = "ASE" if is_ase else "AMP"
-    actor.control_config = json.loads(str(weights["control_config"]))
+    actor.control_config = checkpoint_control({"control_config": json.loads(str(weights["control_config"]))})
     actor.policy_config = json.loads(str(weights["policy_config"])) if "policy_config" in weights else None
     actor.observation_size = int(weights["mean"].size)
     return actor
@@ -486,7 +486,7 @@ def main():
     parser.add_argument("--motion-file", type=Path, help="Use reference initial states; velocity task defaults to standing")
     parser.add_argument("--policy-npz", type=Path, help="Use exported NumPy actor for local MuJoCo")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--command-profile", choices=("walk-stop", "restart", "joystick"))
+    parser.add_argument("--command-profile", choices=("walk", "walk-stop", "restart", "joystick"))
     parser.add_argument("--duration", type=float, help="Velocity replay seconds; default 45")
     parser.add_argument("--no-video", action="store_true", help="Write CSV without camera/video")
     parser.add_argument("--viewer", action="store_true", help="Show the Isaac Gym viewer")
@@ -516,7 +516,7 @@ def main():
     velocity = actor.policy_config is not None
     if velocity:
         spec = actor.policy_config
-        if (spec.get("task") != "HumanoidF1Velocity" or spec.get("version") != 1
+        if (spec.get("task") != "HumanoidF1Velocity" or spec.get("version") not in (1, 2)
                 or actor.observation_size != 96 or actor.algorithm != "ASE"):
             parser.error("Unsupported velocity policy schema")
         if args.engine != "gym":
@@ -555,11 +555,12 @@ def main():
             video = Video(args.output / (stem + "_play.mp4"))
         velocity_columns = ["target_vx", "command_vx", "heading_vx", "heading_vy", "heading_yaw_rate",
                             "vx_error", "encoder_mask", "foot_speed", "leg_joint_speed_rms", "task_reward"]
+        posture_columns = list(engine.task.velocity_posture_telemetry()) if velocity else []
         with (args.output / (stem + "_diag.csv")).open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(["engine", "case", "init", "latent_mode", "step", "time_s", "base_x", "base_y",
                 "base_z", "local_vx", "local_vy", "yaw_rate", "tilt_rad", "done", "termination",
-                "action_rms", *(velocity_columns if velocity else []), *["q_" + n for n in names]])
+                "action_rms", *(velocity_columns if velocity else []), *posture_columns, *["q_" + n for n in names]])
             for case in range(args.cases):
                 state = initial_case(case, cfg, names, args.motion_file) if not velocity or args.motion_file else initial_case(0, cfg, names)
                 obs = engine.reset(state)
@@ -584,9 +585,11 @@ def main():
                         reasons = ["sequence_complete"]
                     done = bool(reasons)
                     telemetry = engine.task.velocity_telemetry()[0].tolist() if velocity else []
+                    posture = engine.task.velocity_posture_telemetry() if velocity else {}
                     seconds = (step + 1) * engine.dt
                     writer.writerow([stem, case, state["init"], mode, step + 1, seconds,
-                                     *values, int(done), "+".join(reasons), action_rms, *telemetry, *q])
+                                     *values, int(done), "+".join(reasons), action_rms, *telemetry,
+                                     *[float(posture[name][0]) for name in posture_columns], *q])
                     if velocity:
                         rows.append([seconds, *telemetry, *values[:2]])
                     if video is not None and (step % 2 == 0 or done):
@@ -596,6 +599,9 @@ def main():
                                  + ("+".join(reasons) if done else "policy rollout"))
                         if velocity:
                             label += " | u {:.2f} c {:.2f} vx {:.2f}".format(*telemetry[:3])
+                            if posture:
+                                label += " | feet {:.0f}/{:.0f} deg".format(
+                                    float(posture["left_foot_yaw_deg"][0]), float(posture["right_foot_yaw_deg"][0]))
                         video.write(engine.render(), label)
                     if args.real_time:
                         delay = wall_start + seconds - time.perf_counter()
