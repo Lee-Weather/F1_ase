@@ -78,17 +78,27 @@ class HumanoidF1(HumanoidAMP):
         self._pd_action_offset = torch.as_tensor(offset, device=self.device)
         self._pd_action_negative_scale = torch.as_tensor(negative, device=self.device)
         self._pd_action_positive_scale = torch.as_tensor(positive, device=self.device)
+        self._pd_clamp_ids = [self._dof_names.index(name) for name in self.cfg["env"].get("pdTargetClampJoints", [])]
 
-    def _action_to_pd_targets(self, action):
+    def _raw_action_to_pd_targets(self, action):
         return action_to_targets(action, self._pd_action_offset,
                                  self._pd_action_negative_scale, self._pd_action_positive_scale)
+
+    def _action_to_pd_targets(self, action):
+        target = self._raw_action_to_pd_targets(action)
+        if self._pd_clamp_ids:
+            ids = self._pd_clamp_ids
+            target[..., ids] = torch.max(self.dof_limits_lower[ids],
+                                        torch.min(target[..., ids], self.dof_limits_upper[ids]))
+        return target
 
     def get_control_config(self):
         return {key: self.cfg["env"][key] for key in CONTROL_KEYS if key in self.cfg["env"]}
 
     def validate_control_config(self, saved):
         for key, value in checkpoint_control({"control_config": saved} if saved is not None else {}).items():
-            if self.cfg["env"].get(key, {} if key == "pdTargetLimits" else None) != value:
+            default = {} if key == "pdTargetLimits" else ([] if key == "pdTargetClampJoints" else None)
+            if self.cfg["env"].get(key, default) != value:
                 raise ValueError("Checkpoint control mismatch for " + key + "; start a fresh training run")
 
     def _build_termination_heights(self):

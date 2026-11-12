@@ -55,6 +55,10 @@ def load_cfg(args):
         cfg_train = yaml.load(f, Loader=yaml.SafeLoader)
 
     cfg = load_env_config(os.path.join(os.getcwd(), args.cfg_env))
+    if args.task == "HumanoidF1Velocity":
+        algorithm = cfg_train["params"]["algo"]["name"].upper()
+        if algorithm != cfg["env"].get("policyAlgorithm", "ASE"):
+            raise ValueError("Velocity environment and training algorithm differ")
     if getattr(args, "velocity_stage", None) is not None:
         if args.task != "HumanoidF1Velocity":
             raise ValueError("--velocity_stage requires HumanoidF1Velocity")

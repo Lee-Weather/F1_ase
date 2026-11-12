@@ -57,6 +57,15 @@ def mean_metric(value):
                for v in values) / len(values)
 
 
+def discriminator_log_metrics(train_info):
+    """Measured minibatch diagnostics shared by console logging and the smoke check."""
+    labels = {"disc_agent_acc": "policy_accuracy", "disc_demo_acc": "demo_accuracy",
+              "disc_agent_logit": "policy_logit", "disc_demo_logit": "demo_logit",
+              "disc_grad_penalty": "gradient_penalty"}
+    return {"Discriminator/" + label: mean_metric(train_info[key])
+            for key, label in labels.items() if key in train_info}
+
+
 def prepare_dependencies(install):
     deps = Path(os.environ.get("F1_DEPS_DIR", str(Path(tempfile.gettempdir()) / "f1_ase_deps")))
     if install:
@@ -95,7 +104,7 @@ def main():
     parser.add_argument("--algorithm", choices=("ase", "amp"), default="ase")
     parser.add_argument("--task", choices=("HumanoidF1", "HumanoidF1Velocity"), default="HumanoidF1")
     parser.add_argument("--velocity-stage", choices=("A", "B", "C"),
-                        help="Select a curriculum stage explicitly; otherwise resume the saved stage or start A")
+                        help="Override curriculum; otherwise resume saved stage (fresh ASE: A, AMP: B)")
     parser.add_argument("--cfg-env", help="Environment YAML; defaults to the selected F1 task")
     parser.add_argument("--cfg-train", help="Training YAML; defaults to the selected task/algorithm")
     parser.add_argument("--motion-file", help="Reference NPZ or YAML; defaults to the selected F1 task")
@@ -106,13 +115,12 @@ def main():
         args.max_iterations = 500 if velocity_task else 200
     if args.max_iterations < 1 or args.num_envs < 1:
         parser.error("max_iterations and num_envs must be positive")
-    if velocity_task and args.algorithm != "ase":
-        parser.error("HumanoidF1Velocity requires --algorithm ase")
     if args.velocity_stage is not None and not velocity_task:
         parser.error("--velocity-stage requires HumanoidF1Velocity")
-    args.cfg_env = args.cfg_env or ("ase/data/cfg/humanoid_f1_velocity.yaml" if velocity_task else
+    velocity_env = "humanoid_f1_velocity_amp.yaml" if args.algorithm == "amp" else "humanoid_f1_velocity.yaml"
+    args.cfg_env = args.cfg_env or ("ase/data/cfg/" + velocity_env if velocity_task else
                                      "ase/data/cfg/humanoid_f1.yaml")
-    args.cfg_train = args.cfg_train or ("ase/data/cfg/train/rlg/ase_f1_velocity.yaml" if velocity_task else
+    args.cfg_train = args.cfg_train or ("ase/data/cfg/train/rlg/" + args.algorithm + "_f1_velocity.yaml" if velocity_task else
                                          "ase/data/cfg/train/rlg/" + args.algorithm + "_f1.yaml")
     args.motion_file = args.motion_file or ("ase/data/motions/f1/dataset_f1_walk_stop.yaml" if velocity_task else
                                              "ase/data/motions/f1/dataset_f1.yaml")
@@ -198,6 +206,7 @@ def main():
             metrics.update(self._last_components)
             metrics.update({"Reward/weighted_" + name: value for name, value in
                             self.algo._training_reward_components.items()})
+            metrics.update(discriminator_log_metrics(train_info))
             sigmas = self.algo.experience_buffer.tensor_dict.get("sigmas")
             if sigmas is not None:
                 metrics["Mean action noise std"] = mean_metric(sigmas)

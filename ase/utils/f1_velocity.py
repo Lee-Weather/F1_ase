@@ -31,20 +31,25 @@ def load_env_config(path):
 
 def velocity_settings(env):
     settings = deepcopy(env["velocityTask"])
+    amp = env.get("policyAlgorithm", "ASE") == "AMP"
+    if amp:
+        settings = {key: value for key, value in settings.items() if not key.startswith("encoder")}
     for key in ("maxSpeed", "acceleration", "deceleration", "trackingSigma",
                 "lateralSigma", "yawSigma", "tiltSigma", "quietJointSigma", "quietFootSigma"):
         if settings[key] <= 0:
             raise ValueError("velocityTask." + key + " must be positive")
     if not 0 <= settings["deadzone"] < settings["minMovingSpeed"] <= settings["maxSpeed"]:
         raise ValueError("Velocity deadzone/minimum/maximum are inconsistent")
-    if not 0 <= settings["encoderZeroSpeed"] < settings["encoderFullSpeed"]:
+    if not amp and not 0 <= settings["encoderZeroSpeed"] < settings["encoderFullSpeed"]:
         raise ValueError("Encoder speed gate thresholds are inconsistent")
+    if amp and not 0 <= settings["standCommandZeroSpeed"] < settings["standCommandFullSpeed"]:
+        raise ValueError("Standing command thresholds are inconsistent")
     for key in ("standDuration", "walkDuration"):
         low, high = settings[key]
         if not 0 < low <= high:
             raise ValueError("Invalid " + key)
-    if settings.get("version", 1) == 2:
-        if not 0 <= settings["encoderMotionZeroSpeed"] < settings["encoderMotionFullSpeed"]:
+    if settings.get("version", 1) >= 2:
+        if not amp and not 0 <= settings["encoderMotionZeroSpeed"] < settings["encoderMotionFullSpeed"]:
             raise ValueError("Encoder motion thresholds are inconsistent")
         if settings["progressWindowSeconds"] <= 0:
             raise ValueError("Progress window must be positive")
@@ -59,6 +64,16 @@ def velocity_settings(env):
             if not 0 <= stage["referenceProbability"] <= 1:
                 raise ValueError("Invalid reference initialization probability")
     return settings
+
+
+def stand_command_threshold(settings):
+    return settings.get("standCommandZeroSpeed", settings.get("encoderZeroSpeed", .05))
+
+
+def stop_quiet(command, speed, foot_speed, leg_speed, settings):
+    """Identical instantaneous stop criterion for Gym and offline replay."""
+    return ((command <= stand_command_threshold(settings)) & (speed < .05)
+            & (foot_speed < .1) & (leg_speed < .3))
 
 
 def _clip(value, low, high):
@@ -119,7 +134,8 @@ def task_rewards(velocity, yaw_rate, tilt, leg_velocity, foot_speed, action,
     """Privileged quantities are used for rewards only, never actor inputs."""
     import torch
     weights = settings["rewardWeights"]
-    stop_gate = (1 - commands[:, 0].abs() / settings["encoderFullSpeed"]).clamp(0, 1)
+    full_speed = settings.get("standCommandFullSpeed", settings.get("encoderFullSpeed", .15))
+    stop_gate = (1 - commands[:, 0].abs() / full_speed).clamp(0, 1)
     stop_gate *= (1 - velocity[:, :2].norm(dim=-1) / settings["stopSpeedGate"]).clamp(0, 1)
     quiet = torch.exp(-(leg_velocity / settings["quietJointSigma"]).square().mean(-1)
                       -(foot_speed / settings["quietFootSigma"]).square().mean(-1))
@@ -134,7 +150,7 @@ def task_rewards(velocity, yaw_rate, tilt, leg_velocity, foot_speed, action,
         "torque": -(torque / effort.clamp_min(1)).square().mean(-1),
         "joint_limits": -outside.square().mean(-1),
     }
-    if settings.get("version", 1) == 2:
+    if settings.get("version", 1) >= 2:
         if posture is None:
             raise ValueError("Velocity v2 requires foot geometry and PD targets")
         radians = np.pi / 180
@@ -154,7 +170,15 @@ def task_rewards(velocity, yaw_rate, tilt, leg_velocity, foot_speed, action,
         })
         target = posture["pd_targets"]
         target_outside = (target - torch.max(lower, torch.min(target, upper))) / (upper - lower).clamp_min(1e-3)
-        components["joint_limits"] -= target_outside.square().mean(-1)
+        if settings.get("version", 1) >= 3:
+            # Raw targets retain a learning signal even when execution clamps
+            # the knees. Average over the knees, not all 29 joints.
+            knees = posture["knee_ids"]
+            others = [i for i in range(target.shape[-1]) if i not in knees]
+            components["joint_limits"] -= target_outside[:, others].square().mean(-1)
+            components["joint_limits"] -= target_outside[:, knees].square().mean(-1)
+        else:
+            components["joint_limits"] -= target_outside.square().mean(-1)
     weighted = {key: weights[key] * value for key, value in components.items()}
     return sum(weighted.values()), weighted
 
@@ -171,9 +195,9 @@ def scripted_speed(seconds, profile="walk-stop"):
     return 0.0
 
 
-def policy_spec(settings, dt, motion_file):
+def policy_spec(settings, dt, motion_file, algorithm="ASE"):
     """Versioned deployment-relevant schema stored with the trained policy."""
-    return {
+    spec = {
         "version": settings.get("version", 1), "task": "HumanoidF1Velocity", "actor_obs": 96, "critic_obs": 451,
         "amp_obs": 890, "actions": 29, "latent_dim": 32, "latent_hold_episode": True,
         "actor_fields": [["base_ang_vel", 3], ["projected_gravity", 3],
@@ -183,3 +207,7 @@ def policy_spec(settings, dt, motion_file):
         "command_scale": [1.0, 1.0, 1.0], "control_dt": float(dt),
         "velocity_settings": deepcopy(settings), "motion_file": str(motion_file),
     }
+    if algorithm == "AMP":
+        spec.update(version=3, algorithm="AMP", task_reward_version=settings["version"], latent_dim=0)
+        spec.pop("latent_hold_episode")
+    return spec

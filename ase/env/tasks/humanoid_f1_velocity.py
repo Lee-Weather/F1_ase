@@ -1,4 +1,4 @@
-"""Velocity-conditioned ASE task with hardware-compatible actor observations."""
+"""Velocity-conditioned AMP/ASE with hardware-compatible actor observations."""
 from pathlib import Path
 
 import torch
@@ -7,14 +7,17 @@ from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 from env.tasks.humanoid_f1 import HumanoidF1
 from utils import torch_utils
 from utils.f1_velocity import (encoder_command_mask, encoder_motion_mask, foot_geometry, policy_spec, ramp_commands,
-                               task_rewards, velocity_settings)
+                               task_rewards, velocity_settings, stand_command_threshold, stop_quiet)
 
 
 class HumanoidF1Velocity(HumanoidF1):
     def __init__(self, cfg, sim_params, physics_engine, device_type, device_id, headless):
         self.velocity_settings = velocity_settings(cfg["env"])
-        self._velocity_v2 = self.velocity_settings.get("version", 1) == 2
-        self._curriculum_stage = cfg["env"].get("velocityStageOverride") or "A"
+        self._algorithm = cfg["env"].get("policyAlgorithm", "ASE")
+        self._use_encoder = self._algorithm == "ASE"
+        self._velocity_v2 = self.velocity_settings.get("version", 1) >= 2
+        self._default_stage = cfg["env"].get("velocityDefaultStage", "A")
+        self._curriculum_stage = cfg["env"].get("velocityStageOverride") or self._default_stage
         self._external_velocity_control = False
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self.commands = torch.zeros((self.num_envs, 3), device=self.device)
@@ -22,13 +25,15 @@ class HumanoidF1Velocity(HumanoidF1):
         self._reward_commands = torch.zeros_like(self.commands)
         self._reward_targets = torch.zeros_like(self.commands)
         self._previous_action = torch.zeros_like(self.actions)
-        self._encoder_mask = torch.zeros((self.num_envs, 1), device=self.device)
+        if self._use_encoder:
+            self._encoder_mask = torch.zeros((self.num_envs, 1), device=self.device)
         self._standing_phase = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
         self._command_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._retarget_steps = torch.full_like(self._command_steps, -1)
         self._leg_ids = torch.tensor([i for i, name in enumerate(self._dof_names)
                                      if any(part in name for part in ("hip", "knee", "ankle"))], device=self.device)
         self._feet_ids = self._build_key_body_ids_tensor(["left_ankle_roll_link", "right_ankle_roll_link"])
+        self._knee_ids = [i for i, name in enumerate(self._dof_names) if "knee_pitch" in name]
         self._stop_elapsed = torch.full((self.num_envs,), -1.0, device=self.device)
         self._stop_hold = torch.zeros(self.num_envs, device=self.device)
         self._stop_reported = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -68,7 +73,7 @@ class HumanoidF1Velocity(HumanoidF1):
 
     def set_training_state(self, state):
         if self._velocity_v2:
-            stage = self.cfg["env"].get("velocityStageOverride") or state.get("velocity_stage", "A")
+            stage = self.cfg["env"].get("velocityStageOverride") or state.get("velocity_stage", self._default_stage)
             self.set_curriculum_stage(stage)
 
     def _reset_ref_state_init(self, env_ids):
@@ -126,7 +131,8 @@ class HumanoidF1Velocity(HumanoidF1):
         self._reward_commands[env_ids] = 0
         self._reward_targets[env_ids] = 0
         self._previous_action[env_ids] = 0
-        self._encoder_mask[env_ids] = 0
+        if self._use_encoder:
+            self._encoder_mask[env_ids] = 0
         self._standing_phase[env_ids] = True
         self._stop_elapsed[env_ids] = -1
         self._stop_hold[env_ids] = 0
@@ -237,7 +243,7 @@ class HumanoidF1Velocity(HumanoidF1):
         self._reward_commands.copy_(self.commands)
         self._reward_targets.copy_(self.command_targets)
         self._previous_action.copy_(self.actions)
-        if not self._velocity_v2:
+        if self._use_encoder and not self._velocity_v2:
             self._encoder_mask[:, 0] = encoder_command_mask(self.commands, self.velocity_settings)
             self._encoder_mask *= (self.progress_buf >= self._num_amp_obs_steps - 1).unsqueeze(-1)
         super().pre_physics_step(actions)
@@ -263,8 +269,9 @@ class HumanoidF1Velocity(HumanoidF1):
             self._forward_progress_speed[:] = quat_rotate(heading, delta)[:, 0] / (self._progress_positions.shape[0] * self.dt)
             self._progress_positions[self._progress_cursor] = position
             self._progress_cursor = (self._progress_cursor + 1) % self._progress_positions.shape[0]
-            valid = self.progress_buf >= max(self._num_amp_obs_steps - 1, self._progress_positions.shape[0])
-            self._encoder_mask[:, 0] = encoder_motion_mask(self._reward_commands, self._forward_progress_speed, valid, self.velocity_settings)
+            if self._use_encoder:
+                valid = self.progress_buf >= max(self._num_amp_obs_steps - 1, self._progress_positions.shape[0])
+                self._encoder_mask[:, 0] = encoder_motion_mask(self._reward_commands, self._forward_progress_speed, valid, self.velocity_settings)
             posture = self._posture_state(actions)
         reward, components = task_rewards(
             velocity, yaw_rate, tilt, self._dof_vel[:, self._leg_ids], feet,
@@ -286,14 +293,14 @@ class HumanoidF1Velocity(HumanoidF1):
                       + pose_cfg["upperWeight"] * (error[:, self._upper_ids] / pose_cfg["upperSigma"]).square().mean(-1))
         return dict(foot_yaw=foot_yaw, foot_tilt=foot_tilt, stance=stance,
                     hip_yaw=self._dof_pos[:, self._hip_yaw_ids], stand_pose_error=pose_error,
-                    pd_targets=self._action_to_pd_targets(actions))
+                    pd_targets=self._raw_action_to_pd_targets(actions), knee_ids=self._knee_ids)
 
     def _compute_reset(self):
         super()._compute_reset()
         velocity, yaw_rate, _, feet = self._motion_state()
         speed = velocity[:, :2].norm(dim=-1)
         leg_speed = self._dof_vel[:, self._leg_ids].square().mean(-1).sqrt()
-        quiet_command = self._reward_commands[:, 0] <= self.velocity_settings["encoderZeroSpeed"]
+        quiet_command = self._reward_commands[:, 0] <= stand_command_threshold(self.velocity_settings)
         metrics = self.extras["motion_metrics"]
         metrics.update({
             "target_vx_m_s": self._reward_targets[:, 0],
@@ -304,8 +311,9 @@ class HumanoidF1Velocity(HumanoidF1):
             "stand_speed_m_s": speed[quiet_command],
             "stand_foot_speed_m_s": feet.mean(-1)[quiet_command],
             "stand_leg_speed_rad_s": leg_speed[quiet_command],
-            "encoder_mask": self._encoder_mask[:, 0],
         })
+        if self._use_encoder:
+            metrics["encoder_mask"] = self._encoder_mask[:, 0]
         if self._velocity_v2:
             posture = self._posture_state(self.actions)
             targets = posture["pd_targets"]
@@ -315,6 +323,7 @@ class HumanoidF1Velocity(HumanoidF1):
                 "hip_yaw_abs_deg": torch.rad2deg(posture["hip_yaw"].abs()).flatten(),
                 "stance_foot_tilt_deg": torch.rad2deg(posture["foot_tilt"])[posture["stance"]],
                 "pd_target_outside_fraction": ((targets < self.dof_limits_lower) | (targets > self.dof_limits_upper)).float().mean(-1),
+                "knee_raw_target_below_limit_fraction": (targets[:, self._knee_ids] < self.dof_limits_lower[self._knee_ids]).float().mean(-1),
                 "curriculum_stage": torch.full_like(speed, ord(self._curriculum_stage) - ord("A")),
             })
         error = (velocity[:, 0] - self._reward_commands[:, 0]).abs()
@@ -323,7 +332,7 @@ class HumanoidF1Velocity(HumanoidF1):
             metrics["vx_error_" + name + "_m_s"] = error[moving]
         active = (self._stop_elapsed >= 0) & ~self._stop_reported
         self._stop_elapsed[active] += self.dt
-        quiet = quiet_command & (speed < .05) & (feet.max(-1).values < .1) & (leg_speed < .3)
+        quiet = stop_quiet(self._reward_commands[:, 0], speed, feet.max(-1).values, leg_speed, self.velocity_settings)
         self._stop_hold[:] = torch.where(active & quiet, self._stop_hold + self.dt, 0.0)
         settled = active & (self._stop_hold >= .5) & (self._terminate_buf == 0)
         self.extras["event_metrics"] = {"stop_time_s": self._stop_elapsed[settled].clone()}
@@ -331,13 +340,14 @@ class HumanoidF1Velocity(HumanoidF1):
 
     def post_physics_step(self):
         super().post_physics_step()
-        self.extras["enc_reward_mask"] = self._encoder_mask.clone()
+        if self._use_encoder:
+            self.extras["enc_reward_mask"] = self._encoder_mask.clone()
         if not self._external_velocity_control:
             self._advance_training_commands()
             self._write_commands()
 
     def get_policy_config(self):
-        return policy_spec(self.velocity_settings, self.dt, self.cfg["env"]["motion_file"])
+        return policy_spec(self.velocity_settings, self.dt, self.cfg["env"]["motion_file"], self._algorithm)
 
     def validate_policy_config(self, saved):
         expected = self.get_policy_config()
@@ -346,25 +356,37 @@ class HumanoidF1Velocity(HumanoidF1):
 
     def velocity_telemetry(self):
         velocity, yaw_rate, _, feet = self._motion_state()
-        values = torch.stack((self._reward_targets[:, 0], self._reward_commands[:, 0],
+        columns = [self._reward_targets[:, 0], self._reward_commands[:, 0],
                               velocity[:, 0], velocity[:, 1], yaw_rate,
-                              (velocity[:, 0] - self._reward_commands[:, 0]).abs(),
-                              self._encoder_mask[:, 0], feet.mean(-1),
-                              self._dof_vel[:, self._leg_ids].square().mean(-1).sqrt(), self.rew_buf), dim=-1)
+                              (velocity[:, 0] - self._reward_commands[:, 0]).abs()]
+        if self._use_encoder:
+            columns.append(self._encoder_mask[:, 0])
+        columns.extend([feet.mean(-1), self._dof_vel[:, self._leg_ids].square().mean(-1).sqrt(), self.rew_buf])
+        values = torch.stack(columns, dim=-1)
         return values.detach().cpu().numpy()
+
+    def velocity_telemetry_columns(self):
+        columns = ["target_vx", "command_vx", "heading_vx", "heading_vy", "heading_yaw_rate", "vx_error"]
+        if self._use_encoder:
+            columns.append("encoder_mask")
+        return columns + ["foot_speed", "leg_joint_speed_rms", "task_reward"]
 
     def velocity_posture_telemetry(self):
         """Extra diagnostics are separate so existing stop-summary columns stay stable."""
         if not self._velocity_v2:
             return {}
         posture = self._posture_state(self.actions)
-        values = {"forward_progress_m_s": self._forward_progress_speed}
+        values = {"forward_progress_m_s": self._forward_progress_speed,
+                  "foot_speed_max": self._motion_state()[3].max(-1).values}
         for i, side in enumerate(("left", "right")):
             values[side + "_foot_yaw_deg"] = torch.rad2deg(posture["foot_yaw"][:, i])
             values[side + "_foot_tilt_deg"] = torch.rad2deg(posture["foot_tilt"][:, i])
             values[side + "_foot_stance"] = posture["stance"][:, i]
         for i, name in enumerate(self._dof_names):
             values["pd_target_" + name] = posture["pd_targets"][:, i]
+        executed = self._action_to_pd_targets(self.actions)
+        for i in self._knee_ids:
+            values["executed_pd_target_" + self._dof_names[i]] = executed[:, i]
         values["pd_target_outside_fraction"] = ((posture["pd_targets"] < self.dof_limits_lower)
                                                 | (posture["pd_targets"] > self.dof_limits_upper)).float().mean(-1)
         return {name: value.detach().cpu().numpy() for name, value in values.items()}

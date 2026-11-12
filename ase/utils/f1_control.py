@@ -3,7 +3,7 @@ import numpy as np
 
 
 LEGACY_CONTROL = {"actionMapping": "default_offset", "actionScale": 0.5}
-CONTROL_KEYS = ("actionMapping", "actionScale", "actionLimitMargin", "pdTargetLimits", "defaultJointPos",
+CONTROL_KEYS = ("actionMapping", "actionScale", "actionLimitMargin", "pdTargetLimits", "pdTargetClampJoints", "defaultJointPos",
                 "pdGains", "armature", "controlFrequencyInv")
 
 
@@ -55,4 +55,5 @@ def checkpoint_control(checkpoint):
     # A missing window means the original full-travel mapping, even when the
     # replay YAML now defines a narrower window for newly trained policies.
     control.setdefault("pdTargetLimits", {})
+    control.setdefault("pdTargetClampJoints", [])
     return control

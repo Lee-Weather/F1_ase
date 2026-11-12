@@ -1,0 +1,10 @@
+# AMP keeps the same physical model and observations; train start/stop from B.
+base: humanoid_f1_velocity.yaml
+env:
+  policyAlgorithm: AMP
+  velocityDefaultStage: B
+  pdTargetClampJoints: [left_knee_pitch_joint, right_knee_pitch_joint]
+  velocityTask:
+    version: 3
+    standCommandZeroSpeed: 0.05
+    standCommandFullSpeed: 0.15

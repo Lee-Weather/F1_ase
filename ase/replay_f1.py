@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import yaml
 from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control
-from utils.f1_velocity import load_env_config, scripted_speed
+from utils.f1_velocity import load_env_config, scripted_speed, stop_quiet
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSET = ROOT / "ase/data/assets/f1/mjcf/weichai_f1_29.xml"
@@ -42,7 +42,7 @@ def load_actor(checkpoint, device="cpu"):
     def linear(x, name):
         return F.linear(x, weights[name + ".weight"], weights[name + ".bias"])
 
-    def actor(obs, latent):
+    def actor(obs, latent=None):
         with torch.no_grad():
             obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
             obs = torch.clamp((obs - mean) / scale, -5, 5)
@@ -100,7 +100,7 @@ def load_actor_numpy(path):
     def linear(x, name):
         return x @ weights[name + ".weight"].T + weights[name + ".bias"]
 
-    def actor(obs, latent):
+    def actor(obs, latent=None):
         hidden = np.clip((np.asarray(obs, dtype=np.float32) - weights["mean"]) / weights["scale"], -5, 5)
         if is_ase:
             style = np.maximum(linear(latent, "actor_mlp._style_mlp.0"), 0)
@@ -438,9 +438,11 @@ class MujocoReplay:
         self.renderer.close()
 
 
-def velocity_summary(rows):
+def velocity_summary(rows, foot_speed_max=None, settings=None):
     """Summarize a continuous rollout; all speed errors use the applied command."""
     a = np.asarray(rows, dtype=np.float64)
+    feet = np.asarray(foot_speed_max) if foot_speed_max is not None else a[:, 8]
+    settings = settings or {}
     stable, elapsed = [], 0.0
     dt = a[1, 0] - a[0, 0] if len(a) > 1 else .02
     for i, row in enumerate(a):
@@ -452,11 +454,11 @@ def velocity_summary(rows):
     for i in range(1, len(a)):
         if a[i-1, 1] > 0 and a[i, 1] == 0:
             hold = 0.0
-            for row in a[i:]:
+            for j, row in enumerate(a[i:], i):
                 if row[1] > 0:
                     break
-                quiet = np.hypot(row[3], row[4]) < .05 and row[8] < .1 and row[9] < .3
-                hold = hold + dt if quiet and row[2] <= .05 else 0.0
+                quiet = stop_quiet(row[2], np.hypot(row[3], row[4]), feet[j], row[9], settings)
+                hold = hold + dt if quiet else 0.0
                 if hold >= .5 - 1e-6:
                     stop_times.append(float(row[0] - a[i, 0] + dt))
                     break
@@ -469,7 +471,8 @@ def velocity_summary(rows):
     drift = float(np.linalg.norm(np.diff(tail[:, 11:13], axis=0), axis=1).sum()) if stopped_tail else None
     error = float(a[stable, 6].mean()) if stable.any() else None
     quiet = bool(stopped_tail and np.hypot(tail[:, 3], tail[:, 4]).max() < .05
-                 and tail[:, 8].mean() < .1 and tail[:, 9].mean() < .3)
+                 and np.all(stop_quiet(tail[:, 2], np.hypot(tail[:, 3], tail[:, 4]),
+                                       feet[-len(tail):], tail[:, 9], settings)))
     return dict(steady_vx_mae_m_s=error, stop_times_s=stop_times,
                 final_5s_path_m=drift, final_stand_quiet=quiet,
                 numeric_targets_met=bool(error is not None and error <= .12 and quiet
@@ -516,15 +519,17 @@ def main():
     velocity = actor.policy_config is not None
     if velocity:
         spec = actor.policy_config
-        if (spec.get("task") != "HumanoidF1Velocity" or spec.get("version") not in (1, 2)
-                or actor.observation_size != 96 or actor.algorithm != "ASE"):
+        legacy = spec.get("version") in (1, 2) and actor.algorithm == "ASE"
+        amp = (spec.get("version") == 3 and spec.get("algorithm") == actor.algorithm == "AMP"
+               and spec.get("latent_dim") == 0)
+        if spec.get("task") != "HumanoidF1Velocity" or actor.observation_size != 96 or not (legacy or amp):
             parser.error("Unsupported velocity policy schema")
         if args.engine != "gym":
             parser.error("Velocity policies currently replay in Isaac Gym only")
     elif actor.observation_size != 93 or args.command_profile or args.duration is not None:
         parser.error("Velocity commands require a velocity-conditioned checkpoint")
     if args.cases is None:
-        args.cases = 3 if velocity else (5 if args.motion_file else 12)
+        args.cases = 1
     if velocity:
         args.command_profile = args.command_profile or "walk-stop"
         args.duration = args.duration or 45.0
@@ -532,6 +537,7 @@ def main():
     cfg = load_env_config(ROOT / "ase/data/cfg" / cfg_name)
     cfg["env"].update(actor.control_config)
     if velocity:
+        cfg["env"]["policyAlgorithm"] = actor.algorithm
         cfg["env"]["velocityTask"] = spec["velocity_settings"]
         control_dt = cfg["sim"]["dt"] * cfg["env"]["controlFrequencyInv"]
         if not np.isclose(control_dt, spec["control_dt"]):
@@ -553,8 +559,7 @@ def main():
                   if args.engine == "gym" else MujocoReplay(cfg, names))
         if not args.no_video:
             video = Video(args.output / (stem + "_play.mp4"))
-        velocity_columns = ["target_vx", "command_vx", "heading_vx", "heading_vy", "heading_yaw_rate",
-                            "vx_error", "encoder_mask", "foot_speed", "leg_joint_speed_rms", "task_reward"]
+        velocity_columns = engine.task.velocity_telemetry_columns() if velocity else []
         posture_columns = list(engine.task.velocity_posture_telemetry()) if velocity else []
         with (args.output / (stem + "_diag.csv")).open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
@@ -565,17 +570,18 @@ def main():
                 state = initial_case(case, cfg, names, args.motion_file) if not velocity or args.motion_file else initial_case(0, cfg, names)
                 obs = engine.reset(state)
                 mode = ("switching" if case >= 8 and not velocity else "fixed") if actor.algorithm == "ASE" else "none"
-                latent = Latents(args.seed + case, mode == "switching")
+                latent = Latents(args.seed + case, mode == "switching") if actor.algorithm == "ASE" else None
                 origin = state["root"][:2].copy()
                 rows = []
+                foot_maxima = []
                 steps = int(round(args.duration / engine.dt)) if velocity else cfg["env"]["episodeLength"] - 1
                 wall_start = time.perf_counter()
                 for step in range(steps):
                     if velocity:
                         speed = pad.read() if pad is not None else scripted_speed(step * control_dt, args.command_profile)
                         obs = engine.command_observation(speed)
-                    z = latent.next()[None, :]
-                    if not args.policy_npz:
+                    z = latent.next()[None, :] if latent is not None else None
+                    if z is not None and not args.policy_npz:
                         z = torch.as_tensor(z, device=engine.device)
                     action = actor(obs, z)
                     action_rms = (float(np.sqrt(np.mean(action ** 2))) if args.policy_npz else
@@ -591,10 +597,14 @@ def main():
                                      *values, int(done), "+".join(reasons), action_rms, *telemetry,
                                      *[float(posture[name][0]) for name in posture_columns], *q])
                     if velocity:
-                        rows.append([seconds, *telemetry, *values[:2]])
+                        # Canonical summary rows retain the legacy layout; the
+                        # unused slot is private, not an AMP encoder metric.
+                        canonical = telemetry if actor.algorithm == "ASE" else telemetry[:6] + [0.0] + telemetry[6:]
+                        rows.append([seconds, *canonical, *values[:2]])
+                        foot_maxima.append(float(posture["foot_speed_max"][0]) if posture else telemetry[velocity_columns.index("foot_speed")])
                     if video is not None and (step % 2 == 0 or done):
                         label = ("F1 " + actor.algorithm + " epoch" + str(actor.epoch) + " | " + stem
-                                 + " | case " + str(case+1) + "/" + str(args.cases) + " | z seed " + str(args.seed+case)
+                                 + " | case " + str(case+1) + "/" + str(args.cases) + " | seed " + str(args.seed+case)
                                  + "\n" + state["init"] + " | {:.2f}s | ".format(seconds)
                                  + ("+".join(reasons) if done else "policy rollout"))
                         if velocity:
@@ -609,12 +619,12 @@ def main():
                             time.sleep(delay)
                     if done:
                         break
-                summary = dict(case=case, init=state["init"], latent=mode, latent_seed=args.seed+case,
+                summary = dict(case=case, init=state["init"], latent=mode, seed=args.seed+case,
                                seconds=round((step+1)*engine.dt, 3),
                                distance_m=round(float(np.linalg.norm(np.array(values[:2])-origin)), 3),
                                termination=reasons)
                 if velocity:
-                    summary.update(velocity_summary(rows))
+                    summary.update(velocity_summary(rows, foot_maxima, spec["velocity_settings"]))
                     summary["sequence_complete"] = reasons == ["sequence_complete"]
                     summary["numeric_targets_met"] &= summary["sequence_complete"]
                 summaries.append(summary)

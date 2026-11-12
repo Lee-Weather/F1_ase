@@ -117,9 +117,9 @@ python ase/run.py --test --task HumanoidAMP --num_envs 16 --cfg_env ase/data/cfg
 
 &nbsp;
 
-### F1 velocity-conditioned ASE
+### F1 velocity-conditioned AMP/ASE
 
-`HumanoidF1Velocity` adds forward speed commands to the F1 ASE actor. It retains
+`HumanoidF1Velocity` adds forward speed commands. The legacy ASE path retains
 the 32-dimensional latent and encoder, with one latent held per episode.
 Actor observations are 93 proprioceptive values plus three commands (96 total);
 the privileged critic has 451 inputs. The actor does not receive simulated base
@@ -165,26 +165,47 @@ overrides it. Start v2 from scratch, rather than resuming a failed v1 policy.
 Replay accepts v1/v2 metadata and restores the saved control window; a missing
 window means the original mapping, so legacy policies do not inherit ±40°.
 
-For stage A, first review three default-posture, zero-initial-speed cases at
-0.5 m/s for 15 seconds (at least ten seconds of sustained correct stepping is
-required before advancing):
+Velocity AMP uses `--algorithm amp` with the same task. The entry selects the
+small `humanoid_f1_velocity_amp.yaml` overlay and `amp_f1_velocity.yaml`.
+It uses actor/critic/discriminator layers [1024, 1024, 512], task/discriminator
+weights 1.0/0.3, and no latent, style network, encoder, encoder reward or mask.
+The AMP actor takes only the 96 observations including the speed command.
+AMP starts in stage B (stand/walk/stop/restart, 0.3–0.6 m/s); stage C extends
+the range to 0.8 m/s after review. Stage A remains an explicit walking-only
+option. There is no automatic stage advancement.
+
+Executed AMP knee PD targets are clamped to their physical joint limits.
+The raw, unclamped requests remain in the joint-limit cost, averaging knees
+separately to avoid dilution across 29 joints. Default joint positions, other
+control channels, physical limits, KP/KD and armature retain their old values.
+Schema 3 records algorithm AMP, latent_dim=0 and a separate task_reward_version;
+old ASE schemas 1/2 and old 93-input AMP checkpoints retain saved controls.
+Start AMP from scratch; ASE optimizer/network weights cannot be resumed into AMP.
+Console logs include discriminator loss/reward, policy/demo accuracy, logits
+and gradient penalty. Accuracy treats policy samples as negative and demos as
+positive; these are classifier diagnostics, not walking acceptance metrics.
+
+After training authorization (this command does not resume ASE):
 
 ```bash
-python ase/replay_f1.py --engine gym --checkpoint /path/to/model_500.pt --output /path/to/czy/data/exp_f1_5 --command-profile walk --duration 15 --cases 3
+python ase/train_f1_cloud.py --task HumanoidF1Velocity --algorithm amp --num_envs 4096 --max_iterations 500 --velocity-stage B --seed 42
 ```
 
-Once a velocity model exists, replay the continuous 45-second stand/walk/stop
-sequence in Isaac Gym (replace paths with the actual checkpoint/archive location):
+Formal acceptance uses one seed (42), default posture and zero initial velocity,
+with one continuous 45-second sequence and no resets:
+0–5 s: 0; 5–13: 0.3; 13–21: 0.6; 21–29: 0.8; 29–35: 0.3; 35–45: 0 m/s.
+A short walking-only check cannot replace this acceptance.
 
 ```bash
-python ase/replay_f1.py --engine gym --checkpoint /path/to/model.pt --output /path/to/czy/data/exp_f1_5 --command-profile walk-stop --cases 3
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model.pt --output /path/to/czy/data/exp_f1_6 --command-profile walk-stop --duration 45 --cases 1 --seed 42
 ```
 
-`--command-profile restart` checks a second start after stopping. Use `--cases 10
---no-video` for numerical checks across ten episode latents. Summaries report
-steady speed MAE, stopping times, final standing motion and the final five-second
-path length. A finished sequence is marked `sequence_complete`, independently of
-numeric targets and human video review. Scripted commands never reset the robot.
+Summaries report steady speed MAE, stop time and final-five-second path length.
+Stop requires speed <0.05 m/s, **maximum** foot speed <0.1 m/s and leg joint RMS
+speed <0.3 rad/s continuously for 0.5 s, within 3 s of the zero target. The final
+five seconds must remain quiet with path <=0.1 m; steady MAE must be <=0.12 m/s.
+A finished sequence is `sequence_complete`, independently of numeric targets
+and human video review. Replay defaults to one case and AMP never samples z.
 
 Interactive input is optional and uses [pygame joystick](https://www.pygame.org/docs/ref/joystick.html)
 (`pygame>=2` is needed only for this mode):

@@ -198,10 +198,38 @@ class VelocityControlTests(unittest.TestCase):
             rows.append([(step+1)*.02, target, c, c, 0, 0, 0, 1, 0, 0, 0, x, 0])
         result = velocity_summary(rows)
         self.assertTrue(result["numeric_targets_met"], result)
+        # A quiet mean foot speed must not hide one foot still moving.
+        feet_max = np.zeros(len(rows))
+        feet_max[-250:] = .11
+        self.assertFalse(velocity_summary(rows, feet_max)["numeric_targets_met"])
         # A robot that keeps walking after the zero target must fail.
         for row in rows[-250:]:
             row[3] = .3
         self.assertFalse(velocity_summary(rows)["numeric_targets_met"])
+
+    def test_amp_schema_and_raw_knee_penalty(self):
+        from utils.f1_control import checkpoint_control
+        env = load_env_config(ASE / "data/cfg/humanoid_f1_velocity_amp.yaml")["env"]
+        settings = velocity_settings(env)
+        spec = policy_spec(settings, .02, "motions.yaml", "AMP")
+        self.assertEqual((spec["version"], spec["task_reward_version"], spec["latent_dim"]), (3, 3, 0))
+        self.assertNotIn("latent_hold_episode", spec)
+        self.assertFalse(any(key.startswith("encoder") for key in settings))
+        self.assertEqual(env["velocityDefaultStage"], "B")
+        self.assertEqual(checkpoint_control({})["pdTargetClampJoints"], [])
+        raw = torch.zeros(1, 29, requires_grad=True)
+        with torch.no_grad():
+            raw[0, :2] = -.2
+        q = torch.zeros(1, 29)
+        posture = dict(foot_yaw=torch.zeros(1, 2), hip_yaw=torch.zeros(1, 2),
+                       foot_tilt=torch.zeros(1, 2), stance=torch.ones(1, 2),
+                       stand_pose_error=torch.zeros(1), pd_targets=raw, knee_ids=[0, 1])
+        _, terms = task_rewards(torch.zeros(1, 3), torch.zeros(1), torch.zeros(1),
+            torch.zeros(1, 12), torch.zeros(1, 2), q, q, q, torch.ones(29), q,
+            torch.zeros(29), torch.ones(29), torch.zeros(1, 3), settings, posture)
+        self.assertAlmostEqual(float(terms["joint_limits"]), -.2 * .2**2, places=6)
+        (-terms["joint_limits"].sum()).backward()
+        self.assertTrue((raw.grad[0, :2] < 0).all())
 
     def test_task_command_and_reward_timing_without_physics(self):
         """Exercise the real task lifecycle with only Gym's I/O boundary replaced."""
