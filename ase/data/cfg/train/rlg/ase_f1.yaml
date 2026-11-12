@@ -1,4 +1,5 @@
-# F1 preparation baseline. No training has been run.
+# F1 ASE LLC: use the complete 24-clip dataset with humanoid_f1.yaml's fixed mapping.
+# Seed -1 is supported; the cloud entry's --seed can select a reproducible run.
 params:
   seed: -1
   algo:

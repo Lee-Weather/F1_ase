@@ -169,6 +169,15 @@ class CommonAgent(a2c_continuous.A2CAgent):
         task = getattr(getattr(getattr(self, 'vec_env', None), 'env', None), 'task', None)
         if hasattr(task, 'get_control_config'):
             weights['control_config'] = task.get_control_config()
+        if hasattr(task, 'get_training_metadata'):
+            metadata = task.get_training_metadata()
+            keys = ('name', 'learning_rate', 'lr_schedule', 'max_epochs', 'num_actors',
+                    'horizon_length', 'minibatch_size', 'mini_epochs', 'save_frequency',
+                    'latent_dim', 'latent_steps_min', 'latent_steps_max', 'enc_coef',
+                    'task_reward_w', 'disc_reward_w', 'enc_reward_w', 'amp_diversity_bonus')
+            metadata['training_config'] = {key: copy.deepcopy(self.config[key]) for key in keys if key in self.config}
+            metadata['seed'] = getattr(task, 'training_seed', task.cfg.get('seed'))
+            weights['training_metadata'] = metadata
         return weights
 
     def set_full_state_weights(self, weights):

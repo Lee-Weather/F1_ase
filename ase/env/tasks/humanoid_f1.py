@@ -1,5 +1,6 @@
 """F1 LLC task: hardware actor observations and privileged training critic."""
 import os
+import copy
 import xml.etree.ElementTree as ET
 
 import torch
@@ -19,6 +20,8 @@ class HumanoidF1(HumanoidAMP):
         self._initial_dof_pos[:] = self._default_joint_pos
         self.actions = torch.zeros((self.num_envs, 29), device=self.device)
         self._episode_start_xy = self._humanoid_root_states[:, :2].clone()
+        self._episode_reference_init = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._knee_ids = [i for i, name in enumerate(self._dof_names) if "knee_pitch" in name]
         self._critic_body_ids = self._build_key_body_ids_tensor(self._critic_body_names)
 
     def _setup_character_props(self, key_bodies):
@@ -86,6 +89,14 @@ class HumanoidF1(HumanoidAMP):
     def get_control_config(self):
         return {key: self.cfg["env"][key] for key in CONTROL_KEYS if key in self.cfg["env"]}
 
+    def get_training_metadata(self):
+        return {"schema_version": 1, "actor_dim": self.num_obs,
+                "critic_dim": self.cfg["env"]["numStates"],
+                "amp_dim": self._num_amp_obs_steps * self._num_amp_obs_per_step,
+                "environment": copy.deepcopy(self.cfg["env"]),
+                "simulation": copy.deepcopy(self.cfg.get("sim", {})),
+                "motions": self._motion_lib.get_manifest()}
+
     def validate_control_config(self, saved):
         for key, value in checkpoint_control({"control_config": saved} if saved is not None else {}).items():
             if self.cfg["env"].get(key) != value:
@@ -104,6 +115,8 @@ class HumanoidF1(HumanoidAMP):
         self.actions[env_ids] = 0
         super()._reset_envs(env_ids)
         self._episode_start_xy[env_ids] = self._humanoid_root_states[env_ids, :2]
+        self._episode_reference_init[env_ids] = False
+        self._episode_reference_init[self._reset_ref_env_ids] = True
 
     def _compute_observations(self, env_ids=None):
         ids = slice(None) if env_ids is None else env_ids
@@ -148,7 +161,20 @@ class HumanoidF1(HumanoidAMP):
         self.extras["motion_metrics"] = {
             "planar_speed_m_s": self._humanoid_root_states[:, 7:9].norm(dim=-1),
             "completed_displacement_m": (self._humanoid_root_states[:, :2] - self._episode_start_xy).norm(dim=-1),
+            "reference_init_fraction": self._episode_reference_init.float(),
+            "knee_flexion_rad": self._dof_pos[:, self._knee_ids].mean(dim=-1),
         }
+        targets = self._action_to_pd_targets(self.actions)
+        self.extras["motion_metrics"]["pd_target_outside_fraction"] = (
+            (targets < self.dof_limits_lower) | (targets > self.dof_limits_upper)).float().mean(dim=-1)
+        self.extras["motion_metrics"]["knee_target_below_limit_fraction"] = (
+            targets[:, self._knee_ids] < self.dof_limits_lower[self._knee_ids]).float().mean(dim=-1)
+        self.extras["episode_metrics"] = {}
+        for source, reference in (("default", False), ("reference", True)):
+            done = (self.reset_buf != 0) & (self._episode_reference_init == reference)
+            self.extras["episode_metrics"][source + "_episode_duration_s"] = self.progress_buf[done].float() * self.dt
+            self.extras["episode_metrics"][source + "_completed_displacement_m"] = (
+                self._humanoid_root_states[done, :2] - self._episode_start_xy[done]).norm(dim=-1)
 
     def _build_amp_observations(self, root_pos, root_rot, root_vel, root_ang_vel,
                                 dof_pos, dof_vel, key_body_pos, *unused):

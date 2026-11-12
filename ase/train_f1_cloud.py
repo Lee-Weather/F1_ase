@@ -57,6 +57,25 @@ def mean_metric(value):
                for v in values) / len(values)
 
 
+def discriminator_log_metrics(train_info):
+    """Policy samples are negative, reference samples are positive."""
+    return {"Discriminator/" + label: mean_metric(train_info[key])
+            for label, key in (("policy_accuracy", "disc_agent_acc"),
+                               ("demo_accuracy", "disc_demo_acc"),
+                               ("policy_logit", "disc_agent_logit"),
+                               ("demo_logit", "disc_demo_logit"),
+                               ("gradient_penalty", "disc_grad_penalty"))
+            if key in train_info}
+
+
+def reward_log_metrics(agent, train_info):
+    metrics = {"Reward/weighted_discriminator":
+               agent._disc_reward_w * mean_metric(train_info["disc_rewards"])}
+    if "enc_rewards" in train_info:
+        metrics["Reward/weighted_encoder"] = agent._enc_reward_w * mean_metric(train_info["enc_rewards"])
+    return metrics
+
+
 def prepare_dependencies(install):
     deps = Path(os.environ.get("F1_DEPS_DIR", str(Path(tempfile.gettempdir()) / "f1_ase_deps")))
     if install:
@@ -85,33 +104,20 @@ def prepare_dependencies(install):
         sys.path.insert(0, str(deps))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--install-deps", action="store_true")
-    parser.add_argument("--num_envs", type=int, default=4096)
-    parser.add_argument("--max_iterations", type=int, default=200)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output_path", default="output")
-    parser.add_argument("--algorithm", choices=("ase", "amp"), default="ase")
-    parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
-    parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
-    args, extra = parser.parse_known_args()
-    if args.max_iterations < 1 or args.num_envs < 1:
-        parser.error("max_iterations and num_envs must be positive")
-
-    os.environ.setdefault("OMP_NUM_THREADS", "4")
-    os.environ.setdefault("MKL_NUM_THREADS", "4")
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(line_buffering=True)
-    prepare_dependencies(args.install_deps)
-    os.chdir(str(ROOT))
-    sys.path.insert(0, str(ROOT / "ase"))
-
-    # Isaac Gym must load before torch (run imports it through utils.config).
-    import run as entry
-    import torch
-
+def cloud_observer_class(entry, args):
     class CloudObserver(entry.RLGPUAlgoObserver):
+        def after_init(self, algo):
+            super().after_init(algo)
+            task = algo.vec_env.env.task
+            task.training_seed = entry.cfg_train["params"]["seed"]
+            metadata = task.get_training_metadata()
+            print("F1_RUNTIME_EFFECTIVE " + json.dumps({
+                "algorithm": args.algorithm, "seed": entry.cfg_train["params"]["seed"],
+                "control_config": task.get_control_config(),
+                "actor_dim": metadata["actor_dim"], "critic_dim": metadata["critic_dim"],
+                "amp_dim": metadata["amp_dim"], "motions": metadata["motions"],
+            }), flush=True)
+
         def process_infos(self, infos, done_indices):
             super().process_infos(infos, done_indices)
             if not hasattr(self, "_termination_counts"):
@@ -124,6 +130,10 @@ def main():
             for name, values in infos.get("motion_metrics", {}).items():
                 if name == "completed_displacement_m":
                     values = values[done_indices.reshape(-1)]
+                if values.numel():
+                    total, count = self._motion_totals.get(name, (0, 0))
+                    self._motion_totals[name] = (total + values.sum().detach(), count + values.numel())
+            for name, values in infos.get("episode_metrics", {}).items():
                 if values.numel():
                     total, count = self._motion_totals.get(name, (0, 0))
                     self._motion_totals[name] = (total + values.sum().detach(), count + values.numel())
@@ -190,6 +200,11 @@ def main():
             })
             if "enc_rewards" in train_info:
                 metrics[reward_prefix + "encoder"] = enc_reward
+            diagnostics = discriminator_log_metrics(train_info)
+            diagnostics.update(reward_log_metrics(self.algo, train_info))
+            metrics.update(diagnostics)
+            for label, value in diagnostics.items():
+                self.writer.add_scalar(label, value, frame)
             block = format_training_log({
                 "epoch": epoch_num, "max_epochs": self.algo.max_epochs, "frame": frame,
                 "fps": self.algo.curr_frames / train_info["total_time"],
@@ -203,6 +218,36 @@ def main():
                 block += "\nF1_TRAIN " + json.dumps(summary)
             return block
 
+    return CloudObserver
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--install-deps", action="store_true")
+    parser.add_argument("--num_envs", type=int, default=4096)
+    parser.add_argument("--max_iterations", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output_path", default="output")
+    parser.add_argument("--algorithm", choices=("ase", "amp"), default="ase")
+    parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
+    parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
+    args, extra = parser.parse_known_args()
+    if args.max_iterations < 1 or args.num_envs < 1:
+        parser.error("max_iterations and num_envs must be positive")
+
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    os.environ.setdefault("MKL_NUM_THREADS", "4")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    prepare_dependencies(args.install_deps)
+    os.chdir(str(ROOT))
+    sys.path.insert(0, str(ROOT / "ase"))
+
+    # Isaac Gym must load before torch (run imports it through utils.config).
+    import run as entry
+    import torch
+
+    CloudObserver = cloud_observer_class(entry, args)
     entry.RLGPUAlgoObserver = CloudObserver
     print("F1_RUNTIME " + json.dumps({
         "python": sys.version.split()[0], "torch": torch.__version__,

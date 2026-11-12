@@ -1,5 +1,6 @@
 """F1 tracking NPZ motions, in simulator name order and xyzw quaternions."""
 from pathlib import Path
+import hashlib
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ class F1MotionLib:
         entries = yaml.safe_load(path.read_text())["motions"] if path.suffix == ".yaml" else [{"file": path.name, "weight": 1.0}]
         clips, lengths, frames, weights = [], [], [], []
         self._motion_files = []
+        self._manifest = []
         for entry in entries:
             file = path.parent / entry["file"]
             with np.load(str(file), allow_pickle=False) as raw:
@@ -39,6 +41,9 @@ class F1MotionLib:
                 lengths.append((n - 1) / fps)
                 weights.append(float(entry["weight"]))
                 self._motion_files.append(str(file))
+                self._manifest.append({"file": file.name, "weight": float(entry["weight"]),
+                                       "frames": n, "fps": fps,
+                                       "sha256": hashlib.sha256(file.read_bytes()).hexdigest()})
         self._motion_lengths = torch.tensor(lengths, device=device)
         self._motion_num_frames = torch.tensor(frames, dtype=torch.long, device=device)
         self._starts = torch.cumsum(self._motion_num_frames, 0) - self._motion_num_frames
@@ -52,6 +57,9 @@ class F1MotionLib:
 
     def num_motions(self):
         return len(self._motion_files)
+
+    def get_manifest(self):
+        return [dict(entry) for entry in self._manifest]
 
     def get_total_length(self):
         return self._motion_lengths.sum()

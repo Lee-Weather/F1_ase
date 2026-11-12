@@ -145,9 +145,11 @@ class Latents:
     def __init__(self, seed, switching):
         self.rng = np.random.RandomState(seed)
         self.switching, self.left, self.value = switching, 0, None
+        self.sample_index = -1
 
     def next(self):
         if self.left <= 0:
+            self.sample_index += 1
             self.value = self.rng.normal(size=32).astype(np.float32)
             self.value /= np.linalg.norm(self.value)
             self.left = int(self.rng.randint(1, 150)) if self.switching else 1000000
@@ -189,7 +191,7 @@ class Video:
 
 
 class GymReplay:
-    def __init__(self, cfg, names):
+    def __init__(self, cfg, names, record_video=True):
         from isaacgym import gymapi
         import torch
         from env.tasks.humanoid_f1 import HumanoidF1
@@ -199,7 +201,7 @@ class GymReplay:
         for key, value in cfg["sim"]["physx"].items():
             if hasattr(params.physx, key):
                 setattr(params.physx, key, value)
-        cfg["env"].update(numEnvs=1, stateInit="Default", enableCameraSensors=True)
+        cfg["env"].update(numEnvs=1, stateInit="Default", enableCameraSensors=record_video)
         cfg["env"]["motion_file"] = str(ROOT / "ase/data/motions/f1/dataset_f1.yaml")
         cfg["env"]["asset"]["assetRoot"] = str(ROOT / "ase/data/assets")
         self.task = HumanoidF1(cfg, params, gymapi.SIM_PHYSX, "cuda", 0, True)
@@ -207,8 +209,8 @@ class GymReplay:
         self.gym, self.sim, self.env = self.task.gym, self.task.sim, self.task.envs[0]
         properties = gymapi.CameraProperties()
         properties.width, properties.height = 640, 480
-        self.cameras = [self.gym.create_camera_sensor(self.env, properties) for _ in range(2)]
-        if min(self.cameras) < 0:
+        self.cameras = [self.gym.create_camera_sensor(self.env, properties) for _ in range(2)] if record_video else []
+        if self.cameras and min(self.cameras) < 0:
             raise RuntimeError("Isaac Gym camera creation failed")
         self.device, self.dt = self.task.device, self.task.dt
 
@@ -267,7 +269,7 @@ def kinematics(pos, quat, linear, angular):
 
 
 class MujocoReplay:
-    def __init__(self, cfg, names):
+    def __init__(self, cfg, names, record_video=True):
         import mujoco
         self.mj, self.cfg = mujoco, cfg["env"]
         xml = ET.parse(ASSET).getroot()
@@ -309,7 +311,7 @@ class MujocoReplay:
         self.base = model.body("base_link").id
         self.floor = model.geom("replay_ground").id
         self.allowed = {model.body(n).id for n in self.cfg["contactBodies"]}
-        self.renderer = mujoco.Renderer(model, height=480, width=640)
+        self.renderer = mujoco.Renderer(model, height=480, width=640) if record_video else None
         self.camera = mujoco.MjvCamera()
         self.option = mujoco.MjvOption()
         self.option.geomgroup[0], self.option.geomgroup[1], self.option.geomgroup[2] = 0, 1, 1
@@ -378,7 +380,8 @@ class MujocoReplay:
         return views
 
     def close(self):
-        self.renderer.close()
+        if self.renderer is not None:
+            self.renderer.close()
 
 
 def main():
@@ -390,11 +393,18 @@ def main():
     parser.add_argument("--motion-file", type=Path, help="Use default pose and four phases of this reference clip")
     parser.add_argument("--policy-npz", type=Path, help="Use exported NumPy actor for local MuJoCo")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--latent-mode", choices=("auto", "fixed", "switching"), default="auto",
+                        help="auto retains the historical case layout; fixed holds one z per case")
+    parser.add_argument("--init-mode", choices=("auto", "default"), default="auto")
+    parser.add_argument("--no-video", action="store_true", help="CSV only, without cameras or encoding")
+    parser.add_argument("--duration", type=float, help="Override replay length in seconds")
     args = parser.parse_args()
     if args.cases is None:
         args.cases = 5 if args.motion_file else 12
     if args.cases < 1:
         parser.error("cases must be positive")
+    if args.duration is not None and (not np.isfinite(args.duration) or args.duration <= 0):
+        parser.error("duration must be finite and positive")
     if args.engine == "gym":
         if args.policy_npz:
             parser.error("policy-npz is supported with mujoco only")
@@ -409,26 +419,35 @@ def main():
     actor = (load_actor_numpy(args.policy_npz) if args.policy_npz else
              load_actor(args.checkpoint, "cuda:0" if args.engine == "gym" else "cpu"))
     cfg["env"].update(actor.control_config)
+    if args.duration is not None:
+        dt = cfg["sim"]["dt"] * cfg["env"]["controlFrequencyInv"]
+        cfg["env"]["episodeLength"] = int(np.ceil(args.duration / dt)) + 1
     print("REPLAY_CONTROL " + json.dumps(actor.control_config), flush=True)
     names = joint_names()
-    engine = GymReplay(cfg, names) if args.engine == "gym" else MujocoReplay(cfg, names)
+    engine = (GymReplay(cfg, names, record_video=not args.no_video) if args.engine == "gym" else
+              MujocoReplay(cfg, names, record_video=not args.no_video))
     stem = "isaac" if args.engine == "gym" else "mujoco"
-    video = Video(args.output / (stem + "_play.mp4"))
+    video = Video(args.output / (stem + "_play.mp4")) if not args.no_video else None
     summaries = []
     try:
         with (args.output / (stem + "_diag.csv")).open("w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
+            latent_columns = ["z_" + str(i) for i in range(32)] if actor.algorithm == "ASE" else []
             writer.writerow(["engine", "case", "init", "latent_mode", "step", "time_s", "base_x", "base_y",
                 "base_z", "local_vx", "local_vy", "yaw_rate", "tilt_rad", "done", "termination",
-                "action_rms", *["q_" + n for n in names]])
+                "action_rms", *["q_" + n for n in names], "seed", "latent_index",
+                *latent_columns])
             for case in range(args.cases):
-                state = initial_case(case, cfg, names, args.motion_file)
+                state = initial_case(0 if args.init_mode == "default" else case, cfg, names, args.motion_file)
                 obs = engine.reset(state)
                 mode = ("switching" if case >= 8 else "fixed") if actor.algorithm == "ASE" else "none"
+                if actor.algorithm == "ASE" and args.latent_mode != "auto":
+                    mode = args.latent_mode
                 latent = Latents(args.seed + case, mode == "switching")
                 origin = state["root"][:2].copy()
                 for step in range(cfg["env"]["episodeLength"] - 1):
-                    z = latent.next()[None, :]
+                    z_numpy = latent.next()
+                    z = z_numpy[None, :]
                     if not args.policy_npz:
                         z = torch.as_tensor(z, device=engine.device)
                     action = actor(obs, z)
@@ -438,8 +457,10 @@ def main():
                     done = bool(reasons)
                     writer.writerow([stem, case, state["init"], mode, step + 1, (step+1)*engine.dt,
                                      *values, int(done), "+".join(reasons),
-                                     action_rms, *q])
-                    if step % 2 == 0 or done:
+                                     action_rms, *q, args.seed + case,
+                                     latent.sample_index if actor.algorithm == "ASE" else -1,
+                                     *(z_numpy.tolist() if actor.algorithm == "ASE" else [])])
+                    if video is not None and (step % 2 == 0 or done):
                         label = ("F1 " + actor.algorithm + " epoch" + str(actor.epoch) + " | " + stem + " | case " + str(case+1) + "/" + str(args.cases)
                                  + " | " + mode + " latent\n" + state["init"] + " | {:.2f}s | ".format((step+1)*engine.dt)
                                  + ("+".join(reasons) if done else "policy rollout"))
@@ -447,13 +468,16 @@ def main():
                     if done:
                         break
                 summary = dict(case=case, init=state["init"], latent=mode, seconds=round((step+1)*engine.dt, 3),
+                               seed=args.seed + case,
+                               latent_samples=latent.sample_index + 1 if actor.algorithm == "ASE" else 0,
                                distance_m=round(float(np.linalg.norm(np.array(values[:2])-origin)), 3),
                                termination=reasons)
                 summaries.append(summary)
                 print(json.dumps(summary), flush=True)
     finally:
         try:
-            video.close()
+            if video is not None:
+                video.close()
         finally:
             engine.close()
     print(json.dumps({"engine": stem, "cases": len(summaries), "mean_duration_s":

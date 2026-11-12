@@ -1,5 +1,54 @@
 # Adversarial Skill Embeddings
 
+### F1 ASE LLC with the complete motion set
+
+`HumanoidF1` uses 24 F1 reference clips from
+`ase/data/motions/f1/dataset_f1.yaml`. The actor has 93 observations, the
+privileged critic has 448, and the discriminator/encoder receive 890 motion
+history features. ASE uses a 32-dimensional latent; no speed command is added.
+
+The `joint_limits` mapping retains the default pose at action zero and uses
+separate positive/negative scales with 10% joint-travel PD margin. This ASE
+experiment starts from scratch; old models retain their saved control mapping.
+PD gains, initialization, sampling weights, latent switching, and
+discriminator/encoder reward weights (0.5/0.5) remain unchanged.
+
+```bash
+python ase/train_f1_cloud.py --algorithm ase --motion-file ase/data/motions/f1/dataset_f1.yaml --num_envs 4096 --max_iterations 3000 --seed 42
+```
+
+Seeds are configurable, with no fixed-seed or single-seed restriction. Logs
+include policy/demo discriminator accuracy and logits, gradient penalty,
+weighted discriminator/encoder rewards, initialization-specific episode
+statistics, and knee/PD-target diagnostics. Startup logs and checkpoints record
+the effective control configuration, reference files and hashes, and actual seed.
+
+The shared preparation tool (outside this training repository) runs a small Gym
+smoke with one ASE optimizer update, checkpoint roundtrip and camera-free replay:
+
+```bash
+python czy/f1_wbt/scripts/prepare_f1.py --ase --seed 42
+```
+
+Run that command from the parent project locally, or the flat project on 201.5.
+On 201.5, activate the existing F1 environment and include
+`/home/robot/czy/f1_ase/.deps` in `PYTHONPATH` to reuse its installed RL dependencies.
+Smoke success checks the implementation, not learned motion quality.
+
+Fixed-latent replay samples a different z per case; switching mode resamples
+during each case. CSV records the case seed, actual latent and sample index.
+`auto` preserves the historical case layout. For example:
+
+```bash
+python ase/replay_f1.py --engine gym --checkpoint MODEL --output RESULT --cases 8 --seed 42 --init-mode default --latent-mode fixed
+python ase/replay_f1.py --engine gym --checkpoint MODEL --output RESULT_SWITCHING --cases 4 --seed 100 --init-mode default --latent-mode switching --no-video
+```
+
+`--duration` overrides replay length; `--no-video` produces CSV without cameras.
+An unconditioned ASE latent can represent standing or backward motion, so one
+random z cannot test the complete repertoire. Assess sustained motion, balance,
+joint movement and behavior changes alongside reward statistics.
+
 **This codebase is now deprecated.** Checkout [MimicKit](https://github.com/xbpeng/MimicKit/) for much more up-to-date and easy-to-use implementations of our methods.
 
 Code accompanying the paper:
