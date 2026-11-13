@@ -52,12 +52,12 @@ def random_rollouts(engine, actor, count, seed):
             for i in range(count)]
 
 
-def analyze_saved(output, device="cuda:0"):
+def analyze_saved(output, device="cuda:0", prefix=""):
     """Add moving-phase and time-aligned diagnostics without rerunning physics."""
     import torch
-    summary_path = output / "coverage_summary.json"
+    summary_path = output / (prefix + "coverage_summary.json")
     report = json.loads(summary_path.read_text())
-    with np.load(output / "coverage_features.npz") as archive:
+    with np.load(output / (prefix + "coverage_features.npz")) as archive:
         arrays = {k: archive[k] for k in archive.files}
     current = torch.as_tensor(arrays["reference"], device=device)
     counts = arrays["reference_counts"]
@@ -120,7 +120,9 @@ def analyze_saved(output, device="cuda:0"):
             row[mode+"_gated_reference_fraction"] = float(close.mean())
             row[mode+"_moving_reference_fraction"] = float(close[moving[j]].mean()) if moving[j].any() else None
         for mode in ("encoded_default", "encoded_reference"):
-            case = next(c for c in report["cases"] if c["mode"] == mode and c["target"] == row["clip"])
+            case = next((c for c in report["cases"] if c["mode"] == mode and c["target"] == row["clip"]), None)
+            if case is None:
+                continue
             for key in ("seconds", "distance_m", "mean_vx", "target_reference_fraction",
                         "target_moving_reference_fraction", "aligned_distance_median"):
                 row[mode+"_own_"+key] = case.get(key)
@@ -131,12 +133,13 @@ def analyze_saved(output, device="cuda:0"):
     report["phase_caveat"] = "phase coverage is unordered; aligned distances are separate and do not establish transition success"
     report["analysis_source_sha256"] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     arrays.update({"min_distance_"+mode: value for mode, value in minimum.items()})
-    temporary = output / "coverage_features.tmp.npz"
+    temporary = output / (prefix + "coverage_features.tmp.npz")
     np.savez_compressed(temporary, **arrays)
-    temporary.replace(output / "coverage_features.npz")
+    temporary.replace(output / (prefix + "coverage_features.npz"))
     summary_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    with (output / "coverage_summary.csv").open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(report["coverage"][0]))
+    with (output / (prefix + "coverage_summary.csv")).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(dict.fromkeys(
+            key for row in report["coverage"] for key in row)))
         writer.writeheader()
         writer.writerows(report["coverage"])
     print("COVERAGE_ANALYSIS_DONE " + str(len(report["coverage"])), flush=True)
@@ -224,14 +227,22 @@ def main():
     parser.add_argument("--random-cases", type=int, default=64)
     parser.add_argument("--seed", type=int, default=20261113)
     parser.add_argument("--latent-seed", type=int, default=1000)
+    parser.add_argument("--clips", type=int, nargs="+", help="One-based dataset clip numbers; default: all")
+    parser.add_argument("--duration", type=float,
+                        help="Seconds per encoded probe; hold the last reference z after the clip ends")
+    parser.add_argument("--prefix", default="", help="Filename prefix to preserve existing replay artifacts")
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--analyze-only", action="store_true",
                         help="Add moving-phase diagnostics to existing features; no simulation")
     args = parser.parse_args()
     if args.random_cases < 0:
         parser.error("random-cases must be nonnegative")
+    if args.duration is not None and (not np.isfinite(args.duration) or args.duration <= 0):
+        parser.error("duration must be finite and positive")
+    if Path(args.prefix).name != args.prefix and args.prefix:
+        parser.error("prefix must be a filename prefix, not a path")
     if args.analyze_only:
-        analyze_saved(args.output)
+        analyze_saved(args.output, prefix=args.prefix)
         return
     import isaacgym  # Must precede torch.
     import torch
@@ -244,14 +255,18 @@ def main():
         parser.error("coverage encoder probes require an ASE checkpoint")
     cfg = yaml.safe_load((ROOT / "ase/data/cfg/humanoid_f1.yaml").read_text())
     cfg["env"].update(actor.control_config)
-    # Preserve all physical/control parameters; the longest clip fits this horizon.
-    cfg["env"]["episodeLength"] = 1001
+    # Only the diagnostic timeout changes; physical/control parameters stay intact.
+    dt = cfg["sim"]["dt"] * cfg["env"]["controlFrequencyInv"]
+    cfg["env"]["episodeLength"] = max(1001, int(np.ceil((args.duration or 0)/dt))+1)
     names = joint_names()
     engine = GymReplay(cfg, names, record_video=False, num_envs=max(1, args.random_cases))
     video = None
     summaries, all_features, all_z, all_ids = [], [], [], []
     try:
         refs = ReferencePairs(engine.task)
+        selected = [i-1 for i in args.clips] if args.clips else list(range(len(refs.names)))
+        if len(set(selected)) != len(selected) or any(i < 0 or i >= len(refs.names) for i in selected):
+            parser.error("clips must be distinct numbers within the dataset")
         encoded = [actor.encode(w.reshape(len(w), -1)) for w in refs.windows]
         random = random_rollouts(engine, actor, args.random_cases, args.latent_seed) if args.random_cases else []
         engine.close()
@@ -259,14 +274,14 @@ def main():
         engine = GymReplay(cfg, names, record_video=not args.no_video)
         refs.task = engine.task
         probes = [("random_fixed", -1) for _ in range(args.random_cases)]
-        probes += [(mode, i) for i in range(len(refs.names))
+        probes += [(mode, i) for i in selected
                    for mode in ("encoded_default", "encoded_reference")]
-        video = Video(args.output / "isaac_coverage.mp4") if not args.no_video else None
+        video = Video(args.output / (args.prefix + "isaac_coverage.mp4")) if not args.no_video else None
         video_frames = 0
         # Track how much of each clip's reference transition manifold is approached.
         reverse = {mode: [np.full(len(t), np.inf) for t in refs.times]
                    for mode in ("random_fixed", "encoded_default", "encoded_reference")}
-        with (args.output / "isaac_coverage.csv").open("w", newline="", encoding="utf-8") as f:
+        with (args.output / (args.prefix + "isaac_coverage.csv")).open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["case", "mode", "target", "latent_seed", "step", "time_s",
                              "base_x", "base_y", "base_z", "local_vx", "local_vy", "yaw_rate",
@@ -284,20 +299,24 @@ def main():
                         engine.task._amp_obs_buf[0] = refs.windows[mid][0]
                     features = [engine.task._curr_amp_obs_buf[0].cpu().numpy().copy()]
                     latents, rows = [], []
-                    for step in range(len(refs.times[mid])):
-                        z = encoded[mid][step:step+1]
+                    steps = int(np.ceil(args.duration/dt)) if args.duration is not None else len(refs.times[mid])
+                    for step in range(steps):
+                        reference_step = min(step, len(refs.times[mid])-1)
+                        z = encoded[mid][reference_step:reference_step+1]
                         action = actor(obs, z)
                         obs, values, reasons, q = engine.step(action)
-                        if step == len(refs.times[mid]) - 1 and not reasons:
+                        if step == steps - 1 and not reasons:
                             reasons = ["probe_end"]
                         features.append(engine.task._curr_amp_obs_buf[0].cpu().numpy().copy())
                         latents.append(z[0].cpu().numpy().copy())
                         rows.append((values, reasons, q.copy()))
                         if video and step % 2 == 0:
-                            label = ("F1 ASE epoch{} | clip {}/{} {} | {}\n".format(
-                                actor.epoch, mid+1, len(refs.names), refs.names[mid], mode)
-                                + "POLICY output | reference-encoder z sequence | t={:.2f}s".format(
-                                    float(refs.times[mid][step])))
+                            label = ("F1 ASE epoch{} | case {}/{} | clip {} {} | {}\n".format(
+                                actor.epoch, case+1, len(probes), mid+1,
+                                refs.names[mid], mode)
+                                + "POLICY output | {} | elapsed={:.2f}s | ref={:.2f}s".format(
+                                    "HOLD final z" if step >= len(refs.times[mid]) else "reference-encoder z sequence",
+                                    (step+1)*engine.dt, float(refs.times[mid][reference_step])))
                             video.write(engine.render(), label)
                             video_frames += 1
                         if reasons:
@@ -336,6 +355,10 @@ def main():
                     closest_histogram=hist, video_start_s=start_video,
                     video_end_s=video_frames/25 if start_video is not None else None)
                 if mid >= 0 and len(valid):
+                    tail = speeds[-min(len(speeds), max(1, round(2/engine.dt))):]
+                    summary.update(reference_sequence_s=len(refs.times[mid])*engine.dt,
+                        tail_2s_mean_speed=float(np.linalg.norm(tail, axis=1).mean()),
+                        tail_2s_max_speed=float(np.linalg.norm(tail, axis=1).max()))
                     summary.update(target_distance_median=float(np.median(valid[:, mid])),
                         target_within_threshold_fraction=float((valid[:, mid] <= refs.thresholds[mid]).mean()))
                 summaries.append(summary)
@@ -345,7 +368,7 @@ def main():
                 f.flush()
                 print("COVERAGE_CASE " + json.dumps(summary), flush=True)
         # Compact feature archive permits metric changes without repeating physics.
-        np.savez_compressed(args.output / "coverage_features.npz", amp=np.concatenate(all_features),
+        np.savez_compressed(args.output / (args.prefix + "coverage_features.npz"), amp=np.concatenate(all_features),
                             z=np.concatenate(all_z), case=np.concatenate(all_ids),
                             reference=np.concatenate([w[:, 0].cpu().numpy() for w in refs.windows]),
                             reference_pair=np.concatenate([p.cpu().numpy() for p in refs.pairs]),
@@ -361,6 +384,8 @@ def main():
         result = dict(checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
                       epoch=actor.epoch, seed=args.seed, latent_seed_start=args.latent_seed,
                       random_cases=args.random_cases, deterministic=True, dt=engine.dt,
+                      selected_clips=[i+1 for i in selected], requested_duration_s=args.duration,
+                      reference_end_behavior="hold final encoded z",
                       random_num_envs=max(1, args.random_cases), encoded_num_envs=1,
                       metric="equal-group standardized 89D AMP consecutive-state RMS",
                       threshold="per-clip self NN p95 excluding +/-0.1s, clipped to [.25,.75]",
@@ -368,13 +393,14 @@ def main():
                       caveat="heuristic support only; nearest label is not proof of learning; encoder probes are auxiliary",
                       references=refs.lib.get_manifest(), coverage=coverage, cases=summaries,
                       video_seconds=video_frames/25)
-        (args.output / "coverage_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-        with (args.output / "coverage_summary.csv").open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(coverage[0]))
+        (args.output / (args.prefix + "coverage_summary.json")).write_text(json.dumps(result, indent=2), encoding="utf-8")
+        with (args.output / (args.prefix + "coverage_summary.csv")).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(dict.fromkeys(
+                key for row in coverage for key in row)))
             writer.writeheader()
             writer.writerows(coverage)
         print("COVERAGE_DONE " + json.dumps(dict(cases=len(summaries), video_seconds=video_frames/25)), flush=True)
-        analyze_saved(args.output)
+        analyze_saved(args.output, prefix=args.prefix)
     finally:
         try:
             if video:

@@ -74,6 +74,19 @@ saved features with the same command plus `--analyze-only`; no simulation runs.
 Moving-phase support additionally requires compatible speed and direction, so
 forward motion does not count as backward motion solely from a similar pose.
 
+To extend selected encoder probes beyond their reference lengths, use one-based
+dataset clip numbers and a fixed duration. After the reference ends, the last
+encoded z is held; the reference does not loop. Both default and reference-state
+initializations are recorded. A filename prefix preserves earlier artifacts:
+
+```bash
+python ase/evaluate_f1_coverage.py --checkpoint LLC.pt --output RESULT --random-cases 0 --clips 1 4 5 9 --duration 10 --prefix stop10_ --seed 20261113
+```
+
+The video labels the reference sequence and final-z hold separately. Tail speed
+statistics cover the last two seconds; an early fall still ends that probe.
+Keep the same prefix when using `--analyze-only` for these saved artifacts.
+
 ### F1 HLC speed control with a frozen ASE LLC
 
 `HumanoidF1HLC` reuses the original HRL/PPO agent. Its actor receives the same
