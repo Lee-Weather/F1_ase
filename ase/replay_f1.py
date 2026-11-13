@@ -470,14 +470,73 @@ def velocity_summary(rows, foot_speed_max=None, settings=None):
     stopped_tail = len(tail) >= int(round(5 / dt)) and np.all(tail[:, 1:3] <= .05)
     drift = float(np.linalg.norm(np.diff(tail[:, 11:13], axis=0), axis=1).sum()) if stopped_tail else None
     error = float(a[stable, 6].mean()) if stable.any() else None
+    segments = []
+    boundaries = [0] + (np.flatnonzero(np.diff(a[:, 1]) != 0) + 1).tolist() + [len(a)]
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        selected = stable[start:end]
+        if a[start, 1] > .05:
+            mae = float(a[start:end, 6][selected].mean()) if selected.any() else None
+            segments.append(dict(start_s=float(a[start, 0] - dt), end_s=float(a[end-1, 0]),
+                                 target_m_s=float(a[start, 1]), steady_samples=int(selected.sum()),
+                                 vx_mae_m_s=mae, passed=bool(mae is not None and mae <= .12)))
     quiet = bool(stopped_tail and np.hypot(tail[:, 3], tail[:, 4]).max() < .05
                  and np.all(stop_quiet(tail[:, 2], np.hypot(tail[:, 3], tail[:, 4]),
                                        feet[-len(tail):], tail[:, 9], settings)))
     return dict(steady_vx_mae_m_s=error, stop_times_s=stop_times,
+                speed_segments=segments, per_segment_speed_met=bool(segments and all(s["passed"] for s in segments)),
                 final_5s_path_m=drift, final_stand_quiet=quiet,
-                numeric_targets_met=bool(error is not None and error <= .12 and quiet
+                numeric_targets_met=bool(segments and all(s["passed"] for s in segments) and quiet
                     and drift <= .10 and stop_times
                     and all(value is not None and value <= 3.0 for value in stop_times)))
+
+
+def gait_summary(rows, posture_rows, joint_rows, names):
+    """Per-speed gait evidence; human video review remains required."""
+    a, q = np.asarray(rows), np.asarray(joint_rows)
+    dt = float(np.median(np.diff(a[:, 0]))) if len(a) > 1 else .02
+    boundaries = [0] + (np.flatnonzero(np.diff(a[:, 1]) != 0) + 1).tolist() + [len(a)]
+    reports = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if a[start, 1] <= .05:
+            continue
+        reached = np.flatnonzero(np.abs(a[start:end, 1] - a[start:end, 2]) <= 1e-5)
+        first = start + int(reached[0]) + int(round(1 / dt)) if len(reached) else end
+        report = dict(target_m_s=float(a[start, 1]), start_s=float(a[start, 0] - dt), feet={})
+        checks = []
+        if end - first < int(round(2 / dt)):
+            report.update(passed=False, reason="less_than_two_steady_seconds")
+            reports.append(report)
+            continue
+        for side in ("left", "right"):
+            knee = np.rad2deg(q[first:end, names.index(side + "_knee_pitch_joint")])
+            yaw = np.array([p[side + "_foot_yaw_deg"] for p in posture_rows[first:end]])
+            foot = dict(knee_p95_p5_deg=float(np.diff(np.percentile(knee, [5, 95]))[0]),
+                        abs_yaw_p95_deg=float(np.percentile(np.abs(yaw), 95)), high_frequency={})
+            for joint in ("ankle_pitch_joint", "ankle_roll_joint"):
+                name = side + "_" + joint
+                for source, signal in (("actual", q[first:end, names.index(name)]),
+                    ("target", np.array([p.get("executed_pd_target_" + name, p["pd_target_" + name])
+                                          for p in posture_rows[first:end]]))):
+                    centered = signal - signal.mean()
+                    rms = float(np.rad2deg(np.sqrt(np.mean(centered**2))))
+                    power = abs(np.fft.rfft(centered * np.hanning(len(signal))))**2
+                    fraction = float(power[np.fft.rfftfreq(len(signal), dt) > 10].sum() / max(power.sum(), 1e-20))
+                    # A near-static ankle has an ill-conditioned energy ratio.
+                    meaningful = rms >= .5
+                    foot["high_frequency"][joint + "/" + source] = dict(rms_deg=rms, above_10hz_fraction=fraction,
+                                                                 meaningful=meaningful)
+                    checks.append(not meaningful or fraction < .1)
+            count_key = side + "_valid_swing_count"
+            count = (float(posture_rows[end-1][count_key] - posture_rows[first][count_key])
+                     if count_key in posture_rows[first] else None)
+            foot["valid_swings"] = count
+            checks.extend([foot["knee_p95_p5_deg"] >= 10, foot["abs_yaw_p95_deg"] <= 25,
+                           count is not None and count >= 2])
+            report["feet"][side] = foot
+        report["passed"] = bool(all(checks))
+        reports.append(report)
+    return dict(gait_segments=reports, gait_targets_met=bool(reports and all(r["passed"] for r in reports)),
+                human_video_review_required=True)
 
 
 def main():
@@ -520,7 +579,7 @@ def main():
     if velocity:
         spec = actor.policy_config
         legacy = spec.get("version") in (1, 2) and actor.algorithm == "ASE"
-        amp = (spec.get("version") == 3 and spec.get("algorithm") == actor.algorithm == "AMP"
+        amp = (spec.get("version") in (3, 4) and spec.get("algorithm") == actor.algorithm == "AMP"
                and spec.get("latent_dim") == 0)
         if spec.get("task") != "HumanoidF1Velocity" or actor.observation_size != 96 or not (legacy or amp):
             parser.error("Unsupported velocity policy schema")
@@ -574,6 +633,7 @@ def main():
                 origin = state["root"][:2].copy()
                 rows = []
                 foot_maxima = []
+                posture_rows, joint_rows = [], []
                 steps = int(round(args.duration / engine.dt)) if velocity else cfg["env"]["episodeLength"] - 1
                 wall_start = time.perf_counter()
                 for step in range(steps):
@@ -602,6 +662,8 @@ def main():
                         canonical = telemetry if actor.algorithm == "ASE" else telemetry[:6] + [0.0] + telemetry[6:]
                         rows.append([seconds, *canonical, *values[:2]])
                         foot_maxima.append(float(posture["foot_speed_max"][0]) if posture else telemetry[velocity_columns.index("foot_speed")])
+                        posture_rows.append({key: float(value[0]) for key, value in posture.items()})
+                        joint_rows.append(q.copy())
                     if video is not None and (step % 2 == 0 or done):
                         label = ("F1 " + actor.algorithm + " epoch" + str(actor.epoch) + " | " + stem
                                  + " | case " + str(case+1) + "/" + str(args.cases) + " | seed " + str(args.seed+case)
@@ -627,6 +689,9 @@ def main():
                     summary.update(velocity_summary(rows, foot_maxima, spec["velocity_settings"]))
                     summary["sequence_complete"] = reasons == ["sequence_complete"]
                     summary["numeric_targets_met"] &= summary["sequence_complete"]
+                    if spec.get("version", 1) >= 2:
+                        summary.update(gait_summary(rows, posture_rows, joint_rows, names))
+                        summary["gait_targets_met"] &= summary["sequence_complete"]
                 summaries.append(summary)
                 print(json.dumps(summary), flush=True)
     finally:

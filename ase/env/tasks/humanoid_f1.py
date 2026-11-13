@@ -10,16 +10,25 @@ from env.tasks.humanoid_amp import HumanoidAMP
 from env.tasks.humanoid_view_motion import HumanoidViewMotion
 from utils import torch_utils
 from utils.f1_motion_lib import F1MotionLib
-from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control, CONTROL_KEYS
+from utils.f1_control import (pd_action_parameters, action_to_targets, targets_to_actions, filter_targets,
+                              checkpoint_control, CONTROL_KEYS, CONTROL_DEFAULTS)
 
 
 class HumanoidF1(HumanoidAMP):
     def __init__(self, cfg, sim_params, physics_engine, device_type, device_id, headless):
+        self._filtered_control = cfg["env"].get("lastActionSource", "raw") == "executed"
         super().__init__(cfg, sim_params, physics_engine, device_type, device_id, headless)
         self._initial_dof_pos[:] = self._default_joint_pos
         self.actions = torch.zeros((self.num_envs, 29), device=self.device)
         self._episode_start_xy = self._humanoid_root_states[:, :2].clone()
         self._critic_body_ids = self._build_key_body_ids_tensor(self._critic_body_names)
+        if self._filtered_control:
+            self._requested_actions = torch.zeros_like(self.actions)
+            self._requested_targets = self._raw_action_to_pd_targets(self.actions)
+            self._executed_targets = self._requested_targets.clone()
+            self._previous_targets = self._executed_targets.clone()
+            self._target_velocity = torch.zeros_like(self.actions)
+            self._target_acceleration = torch.zeros_like(self.actions)
 
     def _setup_character_props(self, key_bodies):
         self._num_actions, self._num_obs, self._dof_obs_size = 29, 93, 29
@@ -79,6 +88,9 @@ class HumanoidF1(HumanoidAMP):
         self._pd_action_negative_scale = torch.as_tensor(negative, device=self.device)
         self._pd_action_positive_scale = torch.as_tensor(positive, device=self.device)
         self._pd_clamp_ids = [self._dof_names.index(name) for name in self.cfg["env"].get("pdTargetClampJoints", [])]
+        self._target_filter_alpha = torch.ones_like(self._pd_action_offset)
+        leg_ids = [i for i, name in enumerate(self._dof_names) if any(p in name for p in ("hip", "knee", "ankle"))]
+        self._target_filter_alpha[leg_ids] = self.cfg["env"].get("legTargetFilterAlpha", 1.0)
 
     def _raw_action_to_pd_targets(self, action):
         return action_to_targets(action, self._pd_action_offset,
@@ -97,9 +109,25 @@ class HumanoidF1(HumanoidAMP):
 
     def validate_control_config(self, saved):
         for key, value in checkpoint_control({"control_config": saved} if saved is not None else {}).items():
-            default = {} if key == "pdTargetLimits" else ([] if key == "pdTargetClampJoints" else None)
+            default = CONTROL_DEFAULTS.get(key)
             if self.cfg["env"].get(key, default) != value:
                 raise ValueError("Checkpoint control mismatch for " + key + "; start a fresh training run")
+
+    def pre_physics_step(self, actions):
+        if self._filtered_control:
+            self._requested_actions.copy_(actions.to(self.device).clamp(-1, 1))
+            self._requested_targets.copy_(self._action_to_pd_targets(self._requested_actions))
+            self._previous_targets.copy_(self._executed_targets)
+            executed = filter_targets(self._requested_targets, self._previous_targets, self._target_filter_alpha)
+            velocity = (executed - self._previous_targets) / self.dt
+            self._target_acceleration[:] = (velocity - self._target_velocity) / self.dt
+            self._target_velocity.copy_(velocity)
+            self._executed_targets.copy_(executed)
+            actions = targets_to_actions(executed, self._pd_action_offset,
+                                         self._pd_action_negative_scale, self._pd_action_positive_scale)
+        # PPO keeps its original sampled actions. Only the environment receives
+        # the effective actions; the parent mapping remains pure.
+        super().pre_physics_step(actions)
 
     def _build_termination_heights(self):
         # F1 termination uses the base height, tilt and disallowed contacts below.
@@ -113,6 +141,18 @@ class HumanoidF1(HumanoidAMP):
             return
         self.actions[env_ids] = 0
         super()._reset_envs(env_ids)
+        if self._filtered_control:
+            self._executed_targets[env_ids] = self._dof_pos[env_ids]
+            self._previous_targets[env_ids] = self._dof_pos[env_ids]
+            self._requested_targets[env_ids] = self._dof_pos[env_ids]
+            self._target_velocity[env_ids] = self._target_acceleration[env_ids] = 0
+            effective = targets_to_actions(self._dof_pos[env_ids], self._pd_action_offset,
+                                           self._pd_action_negative_scale, self._pd_action_positive_scale)
+            self.actions[env_ids] = effective
+            self._requested_actions[env_ids] = effective
+            # Humanoid._reset_envs computed observations before this subclass
+            # restored the filter state. Publish the initialized control state.
+            self._compute_observations(env_ids)
         self._episode_start_xy[env_ids] = self._humanoid_root_states[env_ids, :2]
 
     def _compute_observations(self, env_ids=None):

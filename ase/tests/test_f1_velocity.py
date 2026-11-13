@@ -198,6 +198,14 @@ class VelocityControlTests(unittest.TestCase):
             rows.append([(step+1)*.02, target, c, c, 0, 0, 0, 1, 0, 0, 0, x, 0])
         result = velocity_summary(rows)
         self.assertTrue(result["numeric_targets_met"], result)
+        # A failed high-speed segment cannot be hidden by the global mean.
+        uneven = [row.copy() for row in rows]
+        for row in uneven:
+            if row[1] == .8:
+                row[6] = .2
+        segmented = velocity_summary(uneven)
+        self.assertLess(segmented["steady_vx_mae_m_s"], .12)
+        self.assertFalse(segmented["numeric_targets_met"])
         # A quiet mean foot speed must not hide one foot still moving.
         feet_max = np.zeros(len(rows))
         feet_max[-250:] = .11
@@ -210,6 +218,8 @@ class VelocityControlTests(unittest.TestCase):
     def test_amp_schema_and_raw_knee_penalty(self):
         from utils.f1_control import checkpoint_control
         env = load_env_config(ASE / "data/cfg/humanoid_f1_velocity_amp.yaml")["env"]
+        # Retain the v3 reward/schema contract for archived checkpoints.
+        env["velocityTask"]["version"] = 3
         settings = velocity_settings(env)
         spec = policy_spec(settings, .02, "motions.yaml", "AMP")
         self.assertEqual((spec["version"], spec["task_reward_version"], spec["latent_dim"]), (3, 3, 0))
@@ -230,6 +240,49 @@ class VelocityControlTests(unittest.TestCase):
         self.assertAlmostEqual(float(terms["joint_limits"]), -.2 * .2**2, places=6)
         (-terms["joint_limits"].sum()).backward()
         self.assertTrue((raw.grad[0, :2] < 0).all())
+
+    def test_v4_mapping_filter_and_metadata(self):
+        from utils.f1_control import (action_to_targets, targets_to_actions, filter_targets,
+                                      pd_action_parameters, foot_sole_points, checkpoint_control)
+        import xml.etree.ElementTree as ET
+        env = load_env_config(ASE / "data/cfg/humanoid_f1_velocity_amp.yaml")["env"]
+        names = list(env["defaultJointPos"])
+        urdf = ASE / "data/assets/f1/urdf/f1_29dof.urdf"
+        limits = {j.get("name"): j.find("limit") for j in ET.parse(urdf).getroot().findall("joint")}
+        lower = [float(limits[n].get("lower")) for n in names]
+        upper = [float(limits[n].get("upper")) for n in names]
+        neutral, negative, positive = pd_action_parameters(env, names, lower, upper)
+        knee = names.index("left_knee_pitch_joint")
+        np.testing.assert_allclose(np.rad2deg([neutral[knee], negative[knee], positive[knee]]), [8, 8, 57], atol=1e-5)
+        actions = np.linspace(-1, 1, 29, dtype=np.float32)
+        targets = action_to_targets(actions, neutral, negative, positive)
+        np.testing.assert_allclose(targets_to_actions(targets, neutral, negative, positive), actions, atol=2e-6)
+        self.assertGreater(float(action_to_targets(-np.ones(29) * .5, neutral, negative, positive)[knee]), 0)
+        previous = torch.tensor(neutral).repeat(2, 1)
+        request = torch.tensor(targets).repeat(2, 1)
+        before = previous.clone()
+        actual = filter_targets(request, previous, .4)
+        torch.testing.assert_close(previous, before)  # Reading/mapping cannot advance state.
+        torch.testing.assert_close(actual, .6 * before + .4 * request)
+        spec = policy_spec(velocity_settings(env), .02, "motions.yaml", "AMP")
+        self.assertEqual((spec["version"], spec["actor_obs"], spec["critic_obs"], spec["amp_obs"]), (4, 96, 480, 890))
+        self.assertEqual(spec["actor_fields"][4], ["last_executed_action", 29])
+        self.assertEqual(checkpoint_control({})["lastActionSource"], "raw")
+        self.assertEqual(checkpoint_control({})["legTargetFilterAlpha"], 1)
+        sole = foot_sole_points(urdf)
+        self.assertEqual(sole.shape, (2, 4, 3))
+        np.testing.assert_allclose(sole[..., 2], -.0329915, atol=2e-6)
+        joints = torch.zeros(1, 29)
+        posture = dict(foot_yaw=torch.zeros(1, 2), hip_yaw=torch.zeros(1, 2), foot_tilt=torch.zeros(1, 2),
+                       stance=torch.tensor([[True, False]]), stand_pose_error=torch.zeros(1),
+                       pd_targets=joints, knee_ids=[names.index(s + "_knee_pitch_joint") for s in ("left", "right")],
+                       upper_ids=list(range(17)), normalized_target_jump=torch.ones(1, 12),
+                       sole_speed=torch.tensor([[.1, 10.0]]))
+        _, terms = task_rewards(torch.zeros(1, 3), torch.zeros(1), torch.zeros(1), torch.zeros(1, 12),
+            torch.zeros(1, 2), joints, joints, joints, torch.ones(29), joints,
+            torch.tensor(lower), torch.tensor(upper), torch.zeros(1, 3), velocity_settings(env), posture)
+        self.assertAlmostEqual(float(terms["leg_target_rate"]), -.02, places=6)
+        self.assertAlmostEqual(float(terms["feet_slip"]), -.025, places=6)  # Airborne foot contributes zero.
 
     def test_task_command_and_reward_timing_without_physics(self):
         """Exercise the real task lifecycle with only Gym's I/O boundary replaced."""

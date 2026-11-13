@@ -568,20 +568,25 @@ class AMPAgent(common_agent.CommonAgent):
         return advantages
 
     def _calc_amp_rewards(self, amp_obs):
-        disc_r = self._calc_disc_rewards(amp_obs)
+        with torch.no_grad():
+            logits = self._eval_disc(amp_obs)
+            disc_r = self._disc_rewards_from_logits(logits)
         output = {
-            'disc_rewards': disc_r
+            'disc_rewards': disc_r,
+            'disc_logits': logits,
         }
         return output
 
     def _calc_disc_rewards(self, amp_obs):
         with torch.no_grad():
             disc_logits = self._eval_disc(amp_obs)
-            prob = 1 / (1 + torch.exp(-disc_logits)) 
-            disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self.ppo_device)))
-            disc_r *= self._disc_reward_scale
+            disc_r = self._disc_rewards_from_logits(disc_logits)
 
         return disc_r
+
+    def _disc_rewards_from_logits(self, logits):
+        prob = torch.sigmoid(logits)
+        return -torch.log((1 - prob).clamp_min(.0001)) * self._disc_reward_scale
 
     def _store_replay_amp_obs(self, amp_obs):
         buf_size = self._amp_replay_buffer.get_buffer_size()
@@ -603,6 +608,23 @@ class AMPAgent(common_agent.CommonAgent):
     def _record_train_batch_info(self, batch_dict, train_info):
         super()._record_train_batch_info(batch_dict, train_info)
         train_info['disc_rewards'] = batch_dict['disc_rewards']
+        self._discriminator_phase_metrics = {}
+        obs = batch_dict['obses']
+        task = self.vec_env.env.task
+        if hasattr(task, 'commands') and obs.shape[-1] == 96:
+            command = obs[:, 93]
+            next_command = batch_dict['next_obses'][:, 93]
+            moving = command > .05
+            transition = (next_command - command).abs() > 1e-5
+            groups = {'standing': ~moving & ~transition,
+                      'transition': transition, 'walking_steady': moving & ~transition}
+            for name, low, high in (('low', .15, .4), ('mid', .4, .65), ('high', .65, float('inf'))):
+                groups[name] = (command >= low) & (command < high) & ~transition
+            for name, mask in groups.items():
+                self._discriminator_phase_metrics['AMP_Group/' + name + '/samples'] = int(mask.sum())
+                if mask.any():
+                    for key, values in (('reward', batch_dict['disc_rewards']), ('policy_logit', batch_dict['disc_logits'])):
+                        self._discriminator_phase_metrics['AMP_Group/' + name + '/' + key] = values[mask].mean().item()
         return
 
     def _log_train_info(self, train_info, frame):
@@ -619,6 +641,8 @@ class AMPAgent(common_agent.CommonAgent):
             self._training_reward_components['encoder'] = self._enc_reward_w * train_info['enc_rewards'].mean().item()
         for name, value in self._training_reward_components.items():
             self.writer.add_scalar('Reward/weighted_' + name, value, frame)
+        for name, value in getattr(self, '_discriminator_phase_metrics', {}).items():
+            self.writer.add_scalar(name, value, frame)
 
         self.writer.add_scalar('losses/disc_loss', torch_ext.mean_list(train_info['disc_loss']).item(), frame)
 

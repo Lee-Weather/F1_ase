@@ -1,10 +1,35 @@
-# AMP keeps the same physical model and observations; train start/stop from B.
+# AMP v4 keeps the physical model; filtered control state is observable.
 base: humanoid_f1_velocity.yaml
 env:
   policyAlgorithm: AMP
   velocityDefaultStage: B
   pdTargetClampJoints: [left_knee_pitch_joint, right_knee_pitch_joint]
+  controlNeutralJointPos:
+    left_knee_pitch_joint: 0.1396263402
+    right_knee_pitch_joint: 0.1396263402
+  pdTargetLimits:
+    left_knee_pitch_joint: [0.0, 1.1344640138]
+    right_knee_pitch_joint: [0.0, 1.1344640138]
+    left_ankle_pitch_joint: [-0.4363323130, 0.4363323130]
+    right_ankle_pitch_joint: [-0.4363323130, 0.4363323130]
+    left_ankle_roll_joint: [-0.2617993878, 0.2617993878]
+    right_ankle_roll_joint: [-0.2617993878, 0.2617993878]
+  legTargetFilterAlpha: 0.4
+  lastActionSource: executed
   velocityTask:
-    version: 3
+    version: 4
     standCommandZeroSpeed: 0.05
     standCommandFullSpeed: 0.15
+    footHeadingToleranceDeg: 20
+    contactEnterForce: 15.0
+    contactExitForce: 5.0
+    contactConfirmSeconds: 0.04
+    soleMaxHeight: 0.03
+    solePointBand: 0.005
+    slipSpeedScale: 0.1
+    targetRateFloor: 0.5
+    swingMinSeconds: 0.1
+    swingMinClearance: 0.02
+    rewardWeights:
+      leg_target_rate: 0.02
+      feet_slip: 0.05

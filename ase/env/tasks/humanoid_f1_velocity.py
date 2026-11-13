@@ -6,8 +6,9 @@ from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 
 from env.tasks.humanoid_f1 import HumanoidF1
 from utils import torch_utils
+from utils.f1_control import foot_sole_points
 from utils.f1_velocity import (encoder_command_mask, encoder_motion_mask, foot_geometry, policy_spec, ramp_commands,
-                               task_rewards, velocity_settings, stand_command_threshold, stop_quiet)
+                               task_rewards, velocity_settings, stand_command_threshold, stop_quiet, reference_target_scales)
 
 
 class HumanoidF1Velocity(HumanoidF1):
@@ -16,6 +17,7 @@ class HumanoidF1Velocity(HumanoidF1):
         self._algorithm = cfg["env"].get("policyAlgorithm", "ASE")
         self._use_encoder = self._algorithm == "ASE"
         self._velocity_v2 = self.velocity_settings.get("version", 1) >= 2
+        self._velocity_v4 = self.velocity_settings.get("version", 1) >= 4
         self._default_stage = cfg["env"].get("velocityDefaultStage", "A")
         self._curriculum_stage = cfg["env"].get("velocityStageOverride") or self._default_stage
         self._external_velocity_control = False
@@ -54,6 +56,23 @@ class HumanoidF1Velocity(HumanoidF1):
             stable = self._motion_lib._data["joint_pos"][start + trim:start + count - trim]
             self._stand_pose = stable.median(dim=0).values
             self.set_curriculum_stage(self._curriculum_stage)
+        if self._velocity_v4:
+            cfg_env = cfg["env"]
+            urdf = Path(cfg_env["asset"]["assetRoot"]) / "f1/urdf/f1_29dof.urdf"
+            self._sole_points = torch.as_tensor(foot_sole_points(urdf), device=self.device)
+            shape = (self.num_envs, 2)
+            self._foot_contact = torch.zeros(shape, dtype=torch.bool, device=self.device)
+            self._contact_pending = torch.zeros(shape, dtype=torch.long, device=self.device)
+            self._swing_eligible = torch.zeros_like(self._foot_contact)
+            for name in ("swing_time", "stance_time", "swing_peak", "last_swing_time", "last_swing_clearance",
+                         "valid_swing_count", "sole_height", "sole_speed"):
+                setattr(self, "_" + name, torch.zeros(shape, device=self.device))
+            scales = self.velocity_settings.get("targetRateScales")
+            if scales is None:
+                scales = reference_target_scales(cfg_env["motion_file"], self._dof_names,
+                    self._target_filter_alpha.cpu().numpy(), self.dt, self.velocity_settings["targetRateFloor"])
+                self.velocity_settings["targetRateScales"] = scales
+            self._target_rate_scales = torch.tensor([scales[name] for name in self._dof_names], device=self.device)
 
     def _motion_index(self, name):
         matches = [i for i, file in enumerate(self._motion_lib._motion_files) if Path(file).name == name]
@@ -94,7 +113,7 @@ class HumanoidF1Velocity(HumanoidF1):
     def _setup_character_props(self, key_bodies):
         super()._setup_character_props(key_bodies)
         self._num_obs = 96
-        self.cfg["env"]["numStates"] = 451
+        self.cfg["env"]["numStates"] = 480 if self._velocity_v4 else 451
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
         super()._build_env(env_id, env_ptr, humanoid_asset)
@@ -104,6 +123,8 @@ class HumanoidF1Velocity(HumanoidF1):
         ids = slice(None) if env_ids is None else env_ids
         self.obs_buf[ids, 93:96] = self.commands[ids]
         self.states_buf[ids, 448:451] = self.commands[ids]
+        if self._velocity_v4:
+            self.states_buf[ids, 451:480] = self.actions[ids]
 
     def _compute_observations(self, env_ids=None):
         super()._compute_observations(env_ids)
@@ -139,6 +160,13 @@ class HumanoidF1Velocity(HumanoidF1):
         self._stop_reported[env_ids] = False
         self._sample_duration(env_ids)
         super()._reset_envs(env_ids)
+        if self._velocity_v4:
+            self._previous_action[env_ids] = self.actions[env_ids]
+            self._foot_contact[env_ids] = self._swing_eligible[env_ids] = False
+            self._contact_pending[env_ids] = 0
+            for name in ("swing_time", "stance_time", "swing_peak", "last_swing_time", "last_swing_clearance",
+                         "valid_swing_count", "sole_height", "sole_speed"):
+                getattr(self, "_" + name)[env_ids] = 0
         if self._velocity_v2:
             self._progress_positions[:, env_ids] = self._humanoid_root_states[env_ids, :3]
             self._forward_progress_speed[env_ids] = 0
@@ -261,6 +289,8 @@ class HumanoidF1Velocity(HumanoidF1):
 
     def _compute_reward(self, actions):
         velocity, yaw_rate, tilt, feet = self._motion_state()
+        if self._velocity_v4:
+            self._update_foot_contact()
         posture = None
         if self._velocity_v2:
             position = self._humanoid_root_states[:, :3]
@@ -291,9 +321,52 @@ class HumanoidF1Velocity(HumanoidF1):
         pose_cfg = cfg["standPose"]
         pose_error = ((error[:, self._leg_ids] / pose_cfg["legSigma"]).square().mean(-1)
                       + pose_cfg["upperWeight"] * (error[:, self._upper_ids] / pose_cfg["upperSigma"]).square().mean(-1))
-        return dict(foot_yaw=foot_yaw, foot_tilt=foot_tilt, stance=stance,
+        result = dict(foot_yaw=foot_yaw, foot_tilt=foot_tilt, stance=stance,
                     hip_yaw=self._dof_pos[:, self._hip_yaw_ids], stand_pose_error=pose_error,
                     pd_targets=self._raw_action_to_pd_targets(actions), knee_ids=self._knee_ids)
+        if self._velocity_v4:
+            result.update(stance=self._foot_contact, pd_targets=self._requested_targets,
+                          upper_ids=self._upper_ids, sole_speed=self._sole_speed,
+                          normalized_target_jump=((self._requested_targets - self._previous_targets)
+                              / (self.dt * self._target_rate_scales))[:, self._leg_ids])
+        return result
+
+    def _update_foot_contact(self):
+        """Advance contact/swing state once per physics control step, never on reads."""
+        cfg = self.velocity_settings
+        rotations = self._rigid_body_rot[:, self._feet_ids, None, :].expand(-1, -1, 4, -1)
+        local = self._sole_points[None].expand(self.num_envs, -1, -1, -1)
+        offsets = quat_rotate(rotations.reshape(-1, 4), local.reshape(-1, 3)).reshape_as(local)
+        points = self._rigid_body_pos[:, self._feet_ids, None, :] + offsets
+        omega = self._rigid_body_ang_vel[:, self._feet_ids, None, :].expand_as(offsets)
+        velocities = self._rigid_body_vel[:, self._feet_ids, None, :] + torch.cross(omega, offsets, dim=-1)
+        self._sole_height[:] = points[..., 2].min(-1).values
+        near_bottom = points[..., 2] <= self._sole_height[..., None] + cfg["solePointBand"]
+        point_speed = velocities[..., :2].norm(dim=-1)
+        # The slowest actual bottom vertex approximates a rolling contact point.
+        self._sole_speed[:] = point_speed.masked_fill(~near_bottom, float("inf")).min(-1).values
+        force = self._contact_forces[:, self._feet_ids, 2]
+        threshold = torch.where(self._foot_contact, cfg["contactExitForce"], cfg["contactEnterForce"])
+        desired = (force > threshold) & (self._sole_height < cfg["soleMaxHeight"])
+        self._contact_pending[:] = torch.where(desired != self._foot_contact, self._contact_pending + 1, 0)
+        confirmed = self._contact_pending >= max(1, round(cfg["contactConfirmSeconds"] / self.dt))
+        touchdown = confirmed & desired & ~self._foot_contact
+        takeoff = confirmed & ~desired & self._foot_contact
+        valid = (touchdown & self._swing_eligible & (self._swing_time >= cfg["swingMinSeconds"])
+                 & (self._swing_peak >= cfg["swingMinClearance"]))
+        self._valid_swing_count += valid.float()
+        self._last_swing_time[touchdown] = self._swing_time[touchdown]
+        self._last_swing_clearance[touchdown] = self._swing_peak[touchdown]
+        self._swing_eligible[touchdown] = False
+        self._swing_eligible[takeoff] = True
+        self._foot_contact[:] = torch.where(confirmed, desired, self._foot_contact)
+        self._contact_pending[confirmed] = 0
+        self._swing_time[:] = torch.where(~self._foot_contact, self._swing_time + self.dt, 0)
+        self._stance_time[:] = torch.where(self._foot_contact, self._stance_time + self.dt, 0)
+        self._swing_peak[:] = torch.where(~self._foot_contact,
+            torch.maximum(self._swing_peak, self._sole_height.clamp_min(0)), torch.zeros_like(self._swing_peak))
+        self.extras["gait_events"] = {"swing_time_s": self._last_swing_time[valid].clone(),
+                                      "swing_clearance_m": self._last_swing_clearance[valid].clone()}
 
     def _compute_reset(self):
         super()._compute_reset()
@@ -326,6 +399,15 @@ class HumanoidF1Velocity(HumanoidF1):
                 "knee_raw_target_below_limit_fraction": (targets[:, self._knee_ids] < self.dof_limits_lower[self._knee_ids]).float().mean(-1),
                 "curriculum_stage": torch.full_like(speed, ord(self._curriculum_stage) - ord("A")),
             })
+            if self._velocity_v4:
+                metrics.update({
+                    "leg_target_jump_normalized": posture["normalized_target_jump"].square().mean(-1).sqrt(),
+                    "leg_target_velocity_rad_s": self._target_velocity[:, self._leg_ids].square().mean(-1).sqrt(),
+                    "leg_target_acceleration_rad_s2": self._target_acceleration[:, self._leg_ids].square().mean(-1).sqrt(),
+                    "stance_sole_speed_m_s": self._sole_speed[self._foot_contact],
+                    "sole_height_m": self._sole_height.flatten(),
+                    "valid_swing_count": self._valid_swing_count.flatten(),
+                })
         error = (velocity[:, 0] - self._reward_commands[:, 0]).abs()
         for name, low, high in (("low", .15, .4), ("mid", .4, .65), ("high", .65, float("inf"))):
             moving = (self._reward_commands[:, 0] >= low) & (self._reward_commands[:, 0] < high)
@@ -347,7 +429,11 @@ class HumanoidF1Velocity(HumanoidF1):
             self._write_commands()
 
     def get_policy_config(self):
-        return policy_spec(self.velocity_settings, self.dt, self.cfg["env"]["motion_file"], self._algorithm)
+        spec = policy_spec(self.velocity_settings, self.dt, self.cfg["env"]["motion_file"], self._algorithm)
+        if self._velocity_v4:
+            spec["control_state"] = {"last_action": "inverse_mapped_executed_target",
+                                     "filter_update": "once_per_control_step", "reset": "initialized_joint_position"}
+        return spec
 
     def validate_policy_config(self, saved):
         expected = self.get_policy_config()
@@ -385,8 +471,16 @@ class HumanoidF1Velocity(HumanoidF1):
         for i, name in enumerate(self._dof_names):
             values["pd_target_" + name] = posture["pd_targets"][:, i]
         executed = self._action_to_pd_targets(self.actions)
-        for i in self._knee_ids:
+        for i in (range(self.num_actions) if self._velocity_v4 else self._knee_ids):
             values["executed_pd_target_" + self._dof_names[i]] = executed[:, i]
+            if self._velocity_v4 and i in self._leg_ids.tolist():
+                values["target_velocity_" + self._dof_names[i]] = self._target_velocity[:, i]
+                values["target_acceleration_" + self._dof_names[i]] = self._target_acceleration[:, i]
+        if self._velocity_v4:
+            for i, side in enumerate(("left", "right")):
+                for name in ("sole_height", "sole_speed", "swing_time", "stance_time", "last_swing_time",
+                             "last_swing_clearance", "valid_swing_count"):
+                    values[side + "_" + name] = getattr(self, "_" + name)[:, i]
         values["pd_target_outside_fraction"] = ((posture["pd_targets"] < self.dof_limits_lower)
                                                 | (posture["pd_targets"] > self.dof_limits_upper)).float().mean(-1)
         return {name: value.detach().cpu().numpy() for name, value in values.items()}

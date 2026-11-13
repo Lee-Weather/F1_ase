@@ -63,7 +63,50 @@ def velocity_settings(env):
                 raise ValueError("Curriculum speed outside command range")
             if not 0 <= stage["referenceProbability"] <= 1:
                 raise ValueError("Invalid reference initialization probability")
+    if settings.get("version", 1) >= 4:
+        if not amp or env.get("lastActionSource") != "executed" or not 0 < env.get("legTargetFilterAlpha", 0) <= 1:
+            raise ValueError("Velocity v4 requires AMP and observable filtered targets")
+        if not 0 <= settings["contactExitForce"] < settings["contactEnterForce"]:
+            raise ValueError("Contact force hysteresis is inconsistent")
+        for key in ("contactConfirmSeconds", "soleMaxHeight", "solePointBand", "slipSpeedScale",
+                    "targetRateFloor", "swingMinSeconds", "swingMinClearance"):
+            if settings[key] <= 0:
+                raise ValueError("velocityTask." + key + " must be positive")
     return settings
+
+
+def reference_target_scales(motion_file, names, alpha, dt, floor, diagnostics=None):
+    """P99 request-to-previous-execution rates, using genuine reference timing.
+
+    Each clip starts at its first pose; no artificial jump across clip boundaries.
+    The returned named scales are saved in the policy, so replay needs no re-fit.
+    """
+    path = Path(motion_file)
+    entries = yaml.safe_load(path.read_text())["motions"]
+    rates = []
+    for entry in entries:
+        with np.load(path.parent / entry["file"], allow_pickle=False) as raw:
+            order = [raw["joint_names"].tolist().index(name) for name in names]
+            q = raw["joint_pos"][:, order].astype(np.float64)
+            source_t = np.arange(len(q)) / float(raw["fps"].reshape(-1)[0])
+            times = np.arange(0, source_t[-1] + 1e-8, dt)
+            q = np.stack([np.interp(times, source_t, col) for col in q.T], axis=-1)
+        previous = q[0].copy()
+        executed = [previous.copy()] if diagnostics is not None else None
+        for request in q[1:]:
+            rates.append(np.abs(request - previous) / dt)
+            previous += alpha * (request - previous)
+            if executed is not None:
+                executed.append(previous.copy())
+        if diagnostics is not None:
+            actual = np.asarray(executed)
+            legs = [i for i, name in enumerate(names) if any(p in name for p in ("hip", "knee", "ankle"))]
+            diagnostics[entry["file"]] = {
+                name: {"tracking_rms_deg": round(float(np.rad2deg(np.sqrt(np.mean((actual[:, i] - q[:, i])**2)))), 4),
+                       "range_retained": round(float(np.ptp(actual[:, i]) / max(np.ptp(q[:, i]), 1e-8)), 4)}
+                for i, name in enumerate(names) if i in legs}
+    scales = np.maximum(np.quantile(rates, .99, axis=0), floor)
+    return {name: round(float(value), 6) for name, value in zip(names, scales)}
 
 
 def stand_command_threshold(settings):
@@ -179,6 +222,12 @@ def task_rewards(velocity, yaw_rate, tilt, leg_velocity, foot_speed, action,
             components["joint_limits"] -= target_outside[:, knees].square().mean(-1)
         else:
             components["joint_limits"] -= target_outside.square().mean(-1)
+    if settings.get("version", 1) >= 4:
+        components["action_rate"] = -(action[:, posture["upper_ids"]]
+                                        - previous_action[:, posture["upper_ids"]]).square().mean(-1)
+        components["leg_target_rate"] = -posture["normalized_target_jump"].square().mean(-1)
+        components["feet_slip"] = -((posture["sole_speed"] / settings["slipSpeedScale"]).square()
+                                      * posture["stance"]).mean(-1)
     weighted = {key: weights[key] * value for key, value in components.items()}
     return sum(weighted.values()), weighted
 
@@ -208,6 +257,10 @@ def policy_spec(settings, dt, motion_file, algorithm="ASE"):
         "velocity_settings": deepcopy(settings), "motion_file": str(motion_file),
     }
     if algorithm == "AMP":
-        spec.update(version=3, algorithm="AMP", task_reward_version=settings["version"], latent_dim=0)
+        spec.update(version=max(3, settings["version"]), algorithm="AMP", task_reward_version=settings["version"], latent_dim=0)
         spec.pop("latent_hold_episode")
+        if settings["version"] >= 4:
+            spec["critic_obs"] = 480
+            spec["actor_fields"][4][0] = "last_executed_action"
+            spec["critic_extra_fields"] = [["last_executed_action", 29]]
     return spec

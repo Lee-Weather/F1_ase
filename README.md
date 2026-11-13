@@ -122,7 +122,8 @@ python ase/run.py --test --task HumanoidAMP --num_envs 16 --cfg_env ase/data/cfg
 `HumanoidF1Velocity` adds forward speed commands. The legacy ASE path retains
 the 32-dimensional latent and encoder, with one latent held per episode.
 Actor observations are 93 proprioceptive values plus three commands (96 total);
-the privileged critic has 451 inputs. The actor does not receive simulated base
+the privileged critic has 451 inputs for ASE/v3 AMP and 480 for v4 AMP.
+The actor does not receive simulated base
 linear velocity or reference frames. Lateral/yaw commands are reserved at zero.
 
 The environment extends `humanoid_f1.yaml`, retaining the asset, PD gains and
@@ -174,38 +175,64 @@ AMP starts in stage B (stand/walk/stop/restart, 0.3–0.6 m/s); stage C extends
 the range to 0.8 m/s after review. Stage A remains an explicit walking-only
 option. There is no automatic stage advancement.
 
-Executed AMP knee PD targets are clamped to their physical joint limits.
-The raw, unclamped requests remain in the joint-limit cost, averaging knees
-separately to avoid dilution across 29 joints. Default joint positions, other
-control channels, physical limits, KP/KD and armature retain their old values.
-Schema 3 records algorithm AMP, latent_dim=0 and a separate task_reward_version;
-old ASE schemas 1/2 and old 93-input AMP checkpoints retain saved controls.
-Start AMP from scratch; ASE optimizer/network weights cannot be resumed into AMP.
+AMP v4 maps each knee to 0–65 degrees with an 8-degree control neutral;
+negative actions remain effective throughout their range. Ankle pitch/roll
+targets use ±25/±15 degrees; hip yaw remains ±40 degrees. These target windows
+have no extra margin. Physical limits, default/reset poses, KP/KD and armature
+retain their old values. The 12 leg PD targets are filtered once per control
+step with alpha=0.4; upper-body targets are unfiltered. Filter state resets to
+the initialized joint positions, including reference starts.
+
+The actor's last-action field is the inverse-mapped last executed target.
+The critic appends the same 29 values (480 total), while AMP still reads 890
+unfiltered physical-state values. PPO retains its original sampled actions and
+log-probabilities. The leg request-to-previous-execution jump cost uses per-joint
+reference P99 rates, recorded in the checkpoint, with weight 0.02. Upper-body
+action-rate cost remains separate. Foot heading tolerance is 20 degrees;
+sole-point slip costs use weight 0.05 and the point velocity v + omega × r.
+Contact uses 15/5 N entry/exit hysteresis, 40 ms confirmation and sole height.
+Swing duration, clearance and target acceleration are diagnostics only.
+
+Schema 4 saves these control/observation/reward semantics. Old ASE schemas 1/2,
+v3 AMP and old 93-input AMP checkpoints retain their saved controls, with
+filtering disabled when absent. Start v4 from scratch; older optimizer/network
+states have incompatible control semantics and critic inputs.
 Console logs include discriminator loss/reward, policy/demo accuracy, logits
-and gradient penalty. Accuracy treats policy samples as negative and demos as
+and gradient penalty, plus reward/logit/sample counts for standing, transitions,
+steady walking and speed bins. Empty bins omit reward/logit means.
+Accuracy treats policy samples as negative and demos as
 positive; these are classifier diagnostics, not walking acceptance metrics.
 
 After training authorization (this command does not resume ASE):
 
 ```bash
-python ase/train_f1_cloud.py --task HumanoidF1Velocity --algorithm amp --num_envs 4096 --max_iterations 500 --velocity-stage B --seed 42
+python ase/train_f1_cloud.py --task HumanoidF1Velocity --algorithm amp --num_envs 4096 --max_iterations 1000 --velocity-stage B --seed 42
 ```
 
-Formal acceptance uses one seed (42), default posture and zero initial velocity,
-with one continuous 45-second sequence and no resets:
+Choose and record seeds as appropriate; 42 in these examples is a comparison
+choice, not a fixed requirement. Formal acceptance uses the default posture,
+zero initial velocity and one continuous 45-second sequence without resets:
 0–5 s: 0; 5–13: 0.3; 13–21: 0.6; 21–29: 0.8; 29–35: 0.3; 35–45: 0 m/s.
 A short walking-only check cannot replace this acceptance.
 
 ```bash
-python ase/replay_f1.py --engine gym --checkpoint /path/to/model.pt --output /path/to/czy/data/exp_f1_6 --command-profile walk-stop --duration 45 --cases 1 --seed 42
+python ase/replay_f1.py --engine gym --checkpoint /path/to/model.pt --output /path/to/czy/data/exp_f1_7 --command-profile walk-stop --duration 45 --cases 1 --seed 42
 ```
 
 Summaries report steady speed MAE, stop time and final-five-second path length.
 Stop requires speed <0.05 m/s, **maximum** foot speed <0.1 m/s and leg joint RMS
 speed <0.3 rad/s continuously for 0.5 s, within 3 s of the zero target. The final
-five seconds must remain quiet with path <=0.1 m; steady MAE must be <=0.12 m/s.
+five seconds must remain quiet with path <=0.1 m; steady MAE must be <=0.12 m/s
+in each moving-speed segment. Gait diagnostics report each knee's P95–P5 range
+(candidate minimum 10 degrees), foot yaw P95 (maximum 25 degrees), ankle/target
+spectral power above 10 Hz (below 10% when RMS >=0.5 degree), and confirmed
+swings (at least two per foot/segment, duration >=0.1 s and clearance >=2 cm).
+Steady windows start one second after the applied command reaches its target.
+B-stage 0.8 m/s results are explicitly extrapolation beyond its training range.
 A finished sequence is `sequence_complete`, independently of numeric targets
-and human video review. Replay defaults to one case and AMP never samples z.
+and human video review. Numerical and gait flags are separate; neither replaces
+human review of clear alternating steps and stopping. Replay defaults to one
+case and AMP never samples z.
 
 Interactive input is optional and uses [pygame joystick](https://www.pygame.org/docs/ref/joystick.html)
 (`pygame>=2` is needed only for this mode):

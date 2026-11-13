@@ -155,7 +155,7 @@ def main():
                     self._motion_totals[name] = (total + values.sum().detach(), count + values.numel())
             if not hasattr(self, "_component_totals"):
                 self._component_totals = {}
-            for group in ("reward_components", "event_metrics"):
+            for group in ("reward_components", "event_metrics", "gait_events"):
                 for name, values in infos.get(group, {}).items():
                     if values.numel():
                         tag = ("Task_Reward/" if group == "reward_components" else "Metrics/event/") + name
@@ -207,6 +207,7 @@ def main():
             metrics.update({"Reward/weighted_" + name: value for name, value in
                             self.algo._training_reward_components.items()})
             metrics.update(discriminator_log_metrics(train_info))
+            metrics.update(getattr(self.algo, "_discriminator_phase_metrics", {}))
             sigmas = self.algo.experience_buffer.tensor_dict.get("sigmas")
             if sigmas is not None:
                 metrics["Mean action noise std"] = mean_metric(sigmas)
