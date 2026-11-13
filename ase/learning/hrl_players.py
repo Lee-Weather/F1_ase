@@ -14,6 +14,7 @@ import learning.common_player as common_player
 import learning.ase_models as ase_models
 import learning.ase_network_builder as ase_network_builder
 import learning.ase_players as ase_players
+from utils.f1_hlc import FrozenF1LLC, control_interval, unit_latent
 
 class HRLPlayer(common_player.CommonPlayer):
     def __init__(self, config):
@@ -167,6 +168,10 @@ class HRLPlayer(common_player.CommonPlayer):
         return
 
     def env_step(self, env, obs_dict, action):
+        if self.config.get('frozen_f1_llc', False):
+            obs, reward, done, info = control_interval(
+                env.task, self._llc_agent, action, self._llc_steps, step=env.step)
+            return obs['obs'], reward.cpu(), done.cpu(), info
         if not self.is_tensor_obses:
             actions = actions.cpu().numpy()
             
@@ -208,6 +213,12 @@ class HRLPlayer(common_player.CommonPlayer):
             return torch.from_numpy(obs).to(self.device), torch.from_numpy(rewards), torch.from_numpy(dones), infos
     
     def _build_llc(self, config_params, checkpoint_file):
+        if self.config.get('frozen_f1_llc', False):
+            self._llc_agent = FrozenF1LLC(checkpoint_file, self.device)
+            self.env.task.validate_control_config(self._llc_agent.control_config)
+            if self.env.task.hlc['llcSteps'] != self._llc_steps:
+                raise ValueError('HLC llc_steps differs from task configuration')
+            return
         network_params = config_params['network']
         network_builder = ase_network_builder.ASEBuilder()
         network_builder.load(network_params)
@@ -241,6 +252,8 @@ class HRLPlayer(common_player.CommonPlayer):
         return
 
     def _compute_llc_action(self, obs, actions):
+        if self.config.get('frozen_f1_llc', False):
+            return self._llc_agent(obs[..., :93], unit_latent(actions))
         llc_obs = self._extract_llc_obs(obs)
         processed_obs = self._llc_agent._preproc_obs(llc_obs)
 
@@ -256,5 +269,14 @@ class HRLPlayer(common_player.CommonPlayer):
         return llc_obs
     
     def _calc_disc_reward(self, amp_obs):
+        if self.config.get('frozen_f1_llc', False):
+            return self._llc_agent.disc_reward(amp_obs)
         disc_reward = self._llc_agent._calc_disc_rewards(amp_obs)
         return disc_reward
+
+    def restore(self, fn):
+        if self.config.get('frozen_f1_llc', False) and fn != 'Base':
+            weights = torch_ext.load_checkpoint(fn)
+            if weights.get('llc_dependency') != self._llc_agent.metadata:
+                raise ValueError('HLC checkpoint requires a different LLC')
+        return super().restore(fn)

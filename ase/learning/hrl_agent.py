@@ -21,6 +21,7 @@ import learning.common_agent as common_agent
 import learning.ase_agent as ase_agent
 import learning.ase_models as ase_models
 import learning.ase_network_builder as ase_network_builder
+from utils.f1_hlc import FrozenF1LLC, control_interval
 
 from tensorboardX import SummaryWriter
 
@@ -43,6 +44,12 @@ class HRLAgent(common_agent.CommonAgent):
         return
 
     def env_step(self, actions):
+        if self.config.get('frozen_f1_llc', False):
+            task = self.vec_env.env.task
+            obs, rewards, dones, info = control_interval(
+                task, self._llc_agent, self.preprocess_actions(actions), self._llc_steps,
+                step=self.vec_env.step)
+            return self.obs_to_tensors(obs), rewards.unsqueeze(-1), dones, info
         actions = self.preprocess_actions(actions)
         obs = self.obs['obs']
 
@@ -86,6 +93,18 @@ class HRLAgent(common_agent.CommonAgent):
         self._llc_agent.is_tensor_obses = self.is_tensor_obses
         return obs
 
+    def get_action_values(self, obs_dict):
+        if not self._use_privileged_critic:
+            return super().get_action_values(obs_dict)
+        self.model.eval()
+        with torch.no_grad():
+            result = self.model({'is_train': False, 'prev_actions': None,
+                                 'obs': self._preproc_obs(obs_dict['obs']),
+                                 'critic_obs': obs_dict['states'], 'rnn_states': self.rnn_states})
+            if self.normalize_value:
+                result['values'] = self.value_mean_std(result['values'], True)
+        return result
+
     def preprocess_actions(self, actions):
         clamped_actions = torch.clamp(actions, -1.0, 1.0)
         if not self.is_tensor_obses:
@@ -102,6 +121,8 @@ class HRLAgent(common_agent.CommonAgent):
         for n in range(self.horizon_length):
             self.obs = self.env_reset(done_indices)
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            if self._use_privileged_critic:
+                self.experience_buffer.update_data('critic_obs', n, self.obs['states'])
 
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
@@ -130,7 +151,7 @@ class HRLAgent(common_agent.CommonAgent):
             self.experience_buffer.update_data('next_values', n, next_vals)
 
             self.current_rewards += rewards
-            self.current_lengths += 1
+            self.current_lengths += infos['llc_substeps'] if self.config.get('frozen_f1_llc', False) else 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             done_indices = all_done_indices[::self.num_agents]
   
@@ -151,7 +172,9 @@ class HRLAgent(common_agent.CommonAgent):
 
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_disc_rewards = self.experience_buffer.tensor_dict['disc_rewards']
+        raw_task_rewards = mb_rewards.clone()
         mb_rewards = self._combine_rewards(mb_rewards, mb_disc_rewards)
+        self._mean_training_reward = float(mb_rewards.mean())
 
         mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
         mb_returns = mb_advs + mb_values
@@ -159,6 +182,7 @@ class HRLAgent(common_agent.CommonAgent):
         batch_dict = self.experience_buffer.get_transformed_list(a2c_common.swap_and_flatten01, self.tensor_list)
         batch_dict['returns'] = a2c_common.swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
+        batch_dict['task_rewards'] = a2c_common.swap_and_flatten01(raw_task_rewards)
 
         return batch_dict
     
@@ -171,6 +195,8 @@ class HRLAgent(common_agent.CommonAgent):
 
     def _get_mean_rewards(self):
         rewards = super()._get_mean_rewards()
+        if self.config.get('frozen_f1_llc', False):
+            return rewards
         rewards *= self._llc_steps
         return rewards
 
@@ -200,6 +226,14 @@ class HRLAgent(common_agent.CommonAgent):
         return
 
     def _build_llc(self, config_params, checkpoint_file):
+        if self.config.get('frozen_f1_llc', False):
+            self._llc_agent = FrozenF1LLC(checkpoint_file, self.ppo_device)
+            task = self.vec_env.env.task
+            task.validate_control_config(self._llc_agent.control_config)
+            if task.hlc['llcSteps'] != self._llc_steps:
+                raise ValueError('HLC llc_steps differs from task configuration')
+            print('F1_HLC_LLC ' + str(self._llc_agent.metadata), flush=True)
+            return
         network_params = config_params['network']
         network_builder = ase_network_builder.ASEBuilder()
         network_builder.load(network_params)
@@ -229,6 +263,9 @@ class HRLAgent(common_agent.CommonAgent):
         return config
 
     def _compute_llc_action(self, obs, actions):
+        if self.config.get('frozen_f1_llc', False):
+            from utils.f1_hlc import unit_latent
+            return self._llc_agent(obs[..., :93], unit_latent(actions))
         llc_obs = self._extract_llc_obs(obs)
         processed_obs = self._llc_agent._preproc_obs(llc_obs)
 
@@ -245,6 +282,8 @@ class HRLAgent(common_agent.CommonAgent):
         return llc_obs
 
     def _calc_disc_reward(self, amp_obs):
+        if self.config.get('frozen_f1_llc', False):
+            return self._llc_agent.disc_reward(amp_obs)
         disc_reward = self._llc_agent._calc_disc_rewards(amp_obs)
         return disc_reward
 
@@ -258,6 +297,7 @@ class HRLAgent(common_agent.CommonAgent):
     def _record_train_batch_info(self, batch_dict, train_info):
         super()._record_train_batch_info(batch_dict, train_info)
         train_info['disc_rewards'] = batch_dict['disc_rewards']
+        train_info['task_rewards'] = batch_dict['task_rewards']
         return
 
     def _log_train_info(self, train_info, frame):
@@ -267,3 +307,17 @@ class HRLAgent(common_agent.CommonAgent):
         self.writer.add_scalar('info/disc_reward_mean', disc_reward_mean.item(), frame)
         self.writer.add_scalar('info/disc_reward_std', disc_reward_std.item(), frame)
         return
+
+    def get_full_state_weights(self):
+        weights = super().get_full_state_weights()
+        if self.config.get('frozen_f1_llc', False):
+            weights['llc_dependency'] = self._llc_agent.metadata.copy()
+            weights['hlc_config'] = dict(llc_steps=self._llc_steps,
+                                        task_reward_w=self._task_reward_w, disc_reward_w=self._disc_reward_w)
+        return weights
+
+    def set_full_state_weights(self, weights):
+        if self.config.get('frozen_f1_llc', False):
+            if weights.get('llc_dependency') != self._llc_agent.metadata:
+                raise ValueError('HLC checkpoint requires a different LLC')
+        return super().set_full_state_weights(weights)

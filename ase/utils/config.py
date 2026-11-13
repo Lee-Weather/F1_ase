@@ -11,6 +11,26 @@ import torch
 
 SIM_TIMESTEP = 1.0 / 60.0
 
+
+def load_yaml_config(path):
+    """Read a YAML, with optional relative base configuration and deep overrides."""
+    from pathlib import Path
+    path = Path(path)
+    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    base = value.pop("extends", None)
+    if base is None:
+        return value
+    result = load_yaml_config(path.parent / base)
+
+    def merge(destination, updates):
+        for key, item in updates.items():
+            if isinstance(item, dict) and isinstance(destination.get(key), dict):
+                merge(destination[key], item)
+            else:
+                destination[key] = item
+    merge(result, value)
+    return result
+
 def set_np_formatting():
     np.set_printoptions(edgeitems=30, infstr='inf',
                         linewidth=4000, nanstr='nan', precision=2,
@@ -53,8 +73,7 @@ def load_cfg(args):
     with open(os.path.join(os.getcwd(), args.cfg_train), 'r') as f:
         cfg_train = yaml.load(f, Loader=yaml.SafeLoader)
 
-    with open(os.path.join(os.getcwd(), args.cfg_env), 'r') as f:
-        cfg = yaml.load(f, Loader=yaml.SafeLoader)
+    cfg = load_yaml_config(os.path.join(os.getcwd(), args.cfg_env))
 
     # Override number of environments if passed on the command line
     if args.num_envs > 0:

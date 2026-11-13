@@ -49,6 +49,69 @@ An unconditioned ASE latent can represent standing or backward motion, so one
 random z cannot test the complete repertoire. Assess sustained motion, balance,
 joint movement and behavior changes alongside reward statistics.
 
+For a full-dataset diagnostic on 201.5 (Isaac Gym), run:
+
+```bash
+python ase/evaluate_f1_coverage.py --checkpoint MODEL --output RESULT --random-cases 64 --seed 20261113 --latent-seed 1000
+```
+
+This samples fixed random z from the default pose, then probes every reference
+with its encoder z sequence from both default and matched reference states.
+The latter probes are auxiliary retrieval tests; an unsuccessful encoded z does
+not establish that a skill was never learned. The video shows policy output,
+with clip, z source and initialization labels. No policy optimization occurs.
+`isaac_coverage.mp4` and CSV, `coverage_summary.json`/CSV, and the compact
+`coverage_features.npz` preserve per-case results, reference-transition distances
+and phase coverage without overwriting the ordinary replay files.
+Matching uses two consecutive heading-invariant 89-D AMP states, equal weights
+for seven physical feature groups, and per-clip reference self-distance thresholds.
+These bounded thresholds are diagnostic heuristics; nearest clip names and
+reference-state coverage alone do not certify complete skills or transitions.
+The first 0.5 seconds of every rollout are excluded from coverage support.
+The report also isolates moving reference states (root speed above 0.2 m/s),
+per-target encoder retrieval, and time-aligned distances. Recompute these from
+saved features with the same command plus `--analyze-only`; no simulation runs.
+Moving-phase support additionally requires compatible speed and direction, so
+forward motion does not count as backward motion solely from a similar pose.
+
+### F1 HLC speed control with a frozen ASE LLC
+
+`HumanoidF1HLC` reuses the original HRL/PPO agent. Its actor receives the same
+93 hardware observations as the LLC, followed by local target direction (2)
+and target speed (1): 96 total. The separate HLC critic receives 448 privileged
+features plus those 3 goal features. True linear velocity is used for rewards
+and the critic, not appended to the actor. HLC outputs a continuous 32-D latent,
+normalized to unit length, held for five LLC steps (HLC 10Hz / LLC 50Hz).
+
+The initial task starts from the default pose at zero speed and samples target
+speeds in [0.8,1.2]m/s every 5-8 seconds along fixed world +X. Its reward is
+`exp(-4*(vx-target)^2 - 2*vy^2 - 2*(1-facing_x))`. HLC optimization combines
+0.9 task reward and 0.1 frozen discriminator reward; the encoder is not trained.
+The default timeout is 1500 LLC control steps, or 30 seconds.
+
+The LLC loader restores only actor/discriminator weights and their normalization
+statistics as frozen buffers, with no optimizer or training buffers. Its 93-D
+input, 29-D previous joint action, PD gains, action mapping and physics remain
+unchanged. HLC checkpoints are separate and bind the exact LLC SHA256, epoch and
+dimensions; restoring/replaying with another LLC fails explicitly. Completed
+episode lengths are logged in LLC steps/seconds; training frames count HLC
+decisions. First terminal observations/reasons are latched within each interval,
+and rewards after termination are excluded.
+
+```bash
+# Run from the parent project or the flat 201.5 project; one update, no skill test.
+python czy/f1_wbt/scripts/prepare_f1.py --hlc --llc-checkpoint LLC.pt --seed 20261113
+# Training entry; choose the run length when scheduling the actual experiment.
+python ase/train_f1_cloud.py --algorithm hrl --llc-checkpoint LLC.pt --max_iterations 200 --num_envs 4096 --seed 20261113
+# 30s sequence: 1.0 -> 0.8 -> 1.2 -> 1.0m/s; add --no-video for CSV only.
+python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
+```
+
+Replay writes `isaac_hlc.mp4` and a 50Hz `isaac_hlc.csv` with command, world/body
+velocity, pose, z, task reward and termination. Smoke success verifies the
+engineering path and LLC immutability; it does not establish speed tracking,
+stopping, running, steering or backward locomotion quality.
+
 **This codebase is now deprecated.** Checkout [MimicKit](https://github.com/xbpeng/MimicKit/) for much more up-to-date and easy-to-use implementations of our methods.
 
 Code accompanying the paper:

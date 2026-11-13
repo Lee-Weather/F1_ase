@@ -1,0 +1,70 @@
+# F1 HLC: frozen exp_f1_7 ASE LLC; 50Hz LLC / 10Hz HLC.
+params:
+  seed: -1
+  algo:
+    name: hrl
+  model:
+    name: hrl
+  network:
+    name: hrl
+    separate: true
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: -2.3
+        fixed_sigma: true
+        learn_sigma: false
+    mlp:
+      units:
+      - 1024
+      - 512
+      activation: relu
+      d2rl: false
+      initializer:
+        name: default
+      regularizer:
+        name: None
+  load_checkpoint: false
+  config:
+    name: F1_HLC
+    env_name: rlgpu
+    multi_gpu: false
+    ppo: true
+    mixed_precision: false
+    normalize_input: true
+    normalize_value: true
+    reward_shaper:
+      scale_value: 1
+    normalize_advantage: true
+    gamma: 0.99
+    tau: 0.95
+    learning_rate: 2e-5
+    lr_schedule: constant
+    score_to_win: 20000
+    max_epochs: 10000
+    save_best_after: 10
+    save_frequency: 50
+    print_stats: true
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: false
+    e_clip: 0.2
+    horizon_length: 32
+    minibatch_size: 16384
+    mini_epochs: 6
+    critic_coef: 5
+    clip_value: false
+    seq_len: 4
+    bounds_loss_coef: 10
+    task_reward_w: 0.9
+    disc_reward_w: 0.1
+    llc_steps: 5
+    llc_config: ase/data/cfg/train/rlg/ase_f1.yaml
+    privileged_critic: true
+    frozen_f1_llc: true
+    llc_checkpoint: ''

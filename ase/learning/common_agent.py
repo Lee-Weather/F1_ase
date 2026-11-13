@@ -404,6 +404,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
             'prev_actions': actions_batch, 
             'obs' : obs_batch
         }
+        if self._use_privileged_critic:
+            batch_dict['critic_obs'] = input_dict['critic_obs']
 
         rnn_masks = None
         if self.is_rnn:

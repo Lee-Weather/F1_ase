@@ -1,0 +1,11 @@
+extends: humanoid_f1.yaml
+env:
+  stateInit: Default
+  episodeLength: 1501  # 30s at LLC 50Hz; HLC decisions are 10Hz.
+  hlc:
+    llcSteps: 5
+    speedRange: [0.8, 1.2]
+    commandHoldSeconds: [5.0, 8.0]
+    speedTrackingScale: 4.0
+    lateralTrackingScale: 2.0
+    headingTrackingScale: 2.0

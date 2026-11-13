@@ -62,6 +62,22 @@ def load_actor(checkpoint, device="cpu"):
     actor.epoch = int(ckpt["epoch"])
     actor.algorithm = "ASE" if is_ase else "AMP"
     actor.control_config = checkpoint_control(ckpt)
+    if is_ase and "amp_input_mean_std" in ckpt and "_enc_mlp.0.weight" in weights:
+        amp_norm = ckpt["amp_input_mean_std"]
+        amp_mean = amp_norm["running_mean"].float().to(device)
+        amp_scale = torch.sqrt(amp_norm["running_var"].float().to(device) + 1e-5)
+        enc_layers = sorted(int(k.split(".")[1]) for k in weights
+                            if k.startswith("_enc_mlp.") and k.endswith(".weight"))
+
+        def encode(amp_obs):
+            with torch.no_grad():
+                hidden = torch.as_tensor(amp_obs, dtype=torch.float32, device=device)
+                hidden = torch.clamp((hidden - amp_mean) / amp_scale, -5, 5)
+                for i in enc_layers:
+                    hidden = F.relu(linear(hidden, "_enc_mlp." + str(i)))
+                return F.normalize(linear(hidden, "_enc"), dim=-1)
+
+        actor.encode = encode
     return actor
 
 
@@ -191,20 +207,22 @@ class Video:
 
 
 class GymReplay:
-    def __init__(self, cfg, names, record_video=True):
+    def __init__(self, cfg, names, record_video=True, num_envs=1):
         from isaacgym import gymapi
         import torch
         from env.tasks.humanoid_f1 import HumanoidF1
+        from env.tasks.humanoid_f1_hlc import HumanoidF1HLC
         params = gymapi.SimParams()
         params.dt, params.substeps = cfg["sim"]["dt"], cfg["sim"]["substeps"]
         params.use_gpu_pipeline = params.physx.use_gpu = True
         for key, value in cfg["sim"]["physx"].items():
             if hasattr(params.physx, key):
                 setattr(params.physx, key, value)
-        cfg["env"].update(numEnvs=1, stateInit="Default", enableCameraSensors=record_video)
+        cfg["env"].update(numEnvs=num_envs, stateInit="Default", enableCameraSensors=record_video)
         cfg["env"]["motion_file"] = str(ROOT / "ase/data/motions/f1/dataset_f1.yaml")
         cfg["env"]["asset"]["assetRoot"] = str(ROOT / "ase/data/assets")
-        self.task = HumanoidF1(cfg, params, gymapi.SIM_PHYSX, "cuda", 0, True)
+        task_class = HumanoidF1HLC if "hlc" in cfg["env"] else HumanoidF1
+        self.task = task_class(cfg, params, gymapi.SIM_PHYSX, "cuda", 0, True)
         assert list(self.task._dof_names) == names, "Actor joint order differs from asset"
         self.gym, self.sim, self.env = self.task.gym, self.task.sim, self.task.envs[0]
         properties = gymapi.CameraProperties()

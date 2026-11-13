@@ -203,6 +203,10 @@ def cloud_observer_class(entry, args):
             diagnostics = discriminator_log_metrics(train_info)
             diagnostics.update(reward_log_metrics(self.algo, train_info))
             metrics.update(diagnostics)
+            if args.algorithm == "hrl":
+                metrics["Control/LLC_hz"] = 1/self.algo.vec_env.env.task.dt
+                metrics["Control/HLC_hz"] = 1/(self.algo.vec_env.env.task.dt*self.algo._llc_steps)
+                metrics["Reward/weighted_task"] = self.algo._task_reward_w * mean_metric(train_info["task_rewards"])
             for label, value in diagnostics.items():
                 self.writer.add_scalar(label, value, frame)
             block = format_training_log({
@@ -228,12 +232,17 @@ def main():
     parser.add_argument("--max_iterations", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_path", default="output")
-    parser.add_argument("--algorithm", choices=("ase", "amp"), default="ase")
+    parser.add_argument("--algorithm", choices=("ase", "amp", "hrl"), default="ase")
+    parser.add_argument("--llc-checkpoint", type=Path, help="Frozen ASE model required by F1 HLC")
     parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
     parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
     args, extra = parser.parse_known_args()
     if args.max_iterations < 1 or args.num_envs < 1:
         parser.error("max_iterations and num_envs must be positive")
+    if args.algorithm == "hrl" and not args.llc_checkpoint:
+        parser.error("hrl requires --llc-checkpoint")
+    if args.llc_checkpoint:
+        args.llc_checkpoint = args.llc_checkpoint.resolve()
 
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     os.environ.setdefault("MKL_NUM_THREADS", "4")
@@ -256,15 +265,17 @@ def main():
         "algorithm": args.algorithm, "motion_file": args.motion_file,
     }), flush=True)
     sys.argv = [
-        str(ROOT / "ase/run.py"), "--task", "HumanoidF1", "--headless",
+        str(ROOT / "ase/run.py"), "--task", "HumanoidF1HLC" if args.algorithm == "hrl" else "HumanoidF1", "--headless",
         "--sim_device", "cuda:0", "--pipeline", "gpu", "--rl_device", "cuda:0",
-        "--cfg_env", "ase/data/cfg/humanoid_f1.yaml",
+        "--cfg_env", "ase/data/cfg/humanoid_f1_hlc.yaml" if args.algorithm == "hrl" else "ase/data/cfg/humanoid_f1.yaml",
         "--cfg_train", "ase/data/cfg/train/rlg/" + args.algorithm + "_f1.yaml",
         "--motion_file", args.motion_file,
         "--num_envs", str(args.num_envs), "--max_iterations", str(args.max_iterations),
         "--seed", str(args.seed), "--output_path", args.output_path,
         *extra,
     ]
+    if args.algorithm == "hrl":
+        sys.argv += ["--llc_checkpoint", str(args.llc_checkpoint)]
     entry.main()
 
 
