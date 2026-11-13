@@ -104,6 +104,13 @@ only when a sustained stop occurs. Loaded ankle-link velocity is recorded as a
 foot sliding proxy, not an exact contact-point slip measurement. These tests
 establish behavior for the selected pairs, not for every latent in the LLC.
 
+Replace `--stand-seeds` with `--stand-clip A1_stand_weichai_f1_29.npz` to use a
+fixed z from the checkpoint's encoder and AMP normalizer applied to the clip's
+final ten-frame window. Set `--stand-reference-time` to select another window
+end time. The clip hash, window time, source and exact target z are saved in the
+summary; this changes the skill input without resetting the simulated robot.
+Use a new prefix such as `--prefix a1stop_` to preserve random-z results.
+
 ### F1 HLC speed control with a frozen ASE LLC
 
 `HumanoidF1HLC` reuses the original HRL/PPO agent. Its actor receives the same

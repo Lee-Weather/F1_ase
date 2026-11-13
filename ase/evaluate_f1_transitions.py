@@ -33,6 +33,37 @@ def interpolate_latents(start, end, alpha):
     return (value/np.linalg.norm(value)).astype(np.float32)
 
 
+def standing_targets(args, task, actor):
+    """Fixed random skills or one skill encoded from a real reference window."""
+    if args.stand_seeds:
+        return [dict(label='seed '+str(seed), seed=seed, source='random_seed',
+                     clip=None, reference_time_s=None, latent=Latents(seed, False).next())
+                for seed in args.stand_seeds]
+    import torch
+    if not hasattr(actor, 'encode'):
+        raise ValueError('The checkpoint has no reference encoder')
+    lib = task._motion_lib
+    matches = [i for i, path in enumerate(lib._motion_files)
+               if Path(path).stem == Path(args.stand_clip).stem]
+    if len(matches) != 1:
+        raise ValueError('stand-clip must identify one clip in the loaded dataset')
+    mid = matches[0]
+    length = float(lib._motion_lengths[mid])
+    history = task.dt*(task._num_amp_obs_steps-1)
+    time = length if args.stand_reference_time is None else args.stand_reference_time
+    if not np.isfinite(time) or not history <= time <= length:
+        raise ValueError('Reference time must contain a full AMP history and fit the clip')
+    ids = torch.tensor([mid], device=task.device, dtype=torch.long)
+    times = torch.tensor([time], device=task.device, dtype=torch.float32)
+    window = task.build_amp_obs_demo(ids, times).reshape(1, -1)
+    latent = actor.encode(window)[0].cpu().numpy().copy()
+    reference = lib.get_manifest()[mid]
+    return [dict(label=Path(args.stand_clip).stem+' @'+format(time, '.2f')+'s',
+                 seed=None, source='reference_encoder_fixed', clip=reference['file'],
+                 reference_time_s=time, history_start_s=time-history,
+                 reference_sha256=reference['sha256'], latent=latent)]
+
+
 def summarize(rows, switch_xy, walk_seconds, dt, names):
     """Report stopping only when a low-speed interval lasts at least two seconds."""
     pre = [r for r in rows if walk_seconds-1 < r['time_s'] <= walk_seconds]
@@ -80,7 +111,11 @@ def main():
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--walk-seeds', type=int, nargs='+', required=True)
-    parser.add_argument('--stand-seeds', type=int, nargs='+', required=True)
+    stand = parser.add_mutually_exclusive_group(required=True)
+    stand.add_argument('--stand-seeds', type=int, nargs='+')
+    stand.add_argument('--stand-clip', help='Dataset filename/stem to encode a fixed standing z')
+    parser.add_argument('--stand-reference-time', type=float,
+                        help='Reference window end time in seconds; default: final frame')
     parser.add_argument('--blend-seconds', type=float, nargs='+', default=[0., .5])
     parser.add_argument('--walk-seconds', type=float, default=3.)
     parser.add_argument('--duration', type=float, default=10.)
@@ -95,6 +130,8 @@ def main():
         parser.error('Each blend duration must fit the post-switch interval')
     if args.prefix and Path(args.prefix).name != args.prefix:
         parser.error('prefix must be a filename prefix')
+    if args.stand_reference_time is not None and args.stand_clip is None:
+        parser.error('stand-reference-time requires stand-clip')
     import isaacgym  # Before torch.
     import torch
     torch.set_num_threads(4)
@@ -114,12 +151,14 @@ def main():
     dt = engine.dt
     task = engine.task
     feet = [task._body_names.index(s+'_ankle_roll_link') for s in ('left', 'right')]
-    pairs = list(itertools.product(args.walk_seeds, args.stand_seeds, args.blend_seconds))
+    targets = standing_targets(args, task, actor)
+    pairs = list(itertools.product(args.walk_seeds, targets, args.blend_seconds))
     args.output.mkdir(parents=True, exist_ok=True)
     stem = args.prefix+'isaac'
     video = Video(args.output/(stem+'_play.mp4')) if not args.no_video else None
     summaries, frames = [], 0
-    fields = ['case', 'walk_seed', 'stand_seed', 'blend_s', 'step', 'time_s', 'phase', 'alpha',
+    fields = ['case', 'walk_seed', 'stand_seed', 'stand_source', 'stand_clip', 'stand_reference_time_s',
+              'blend_s', 'step', 'time_s', 'phase', 'alpha',
               'base_x', 'base_y', 'base_z', 'local_vx', 'local_vy', 'yaw_rate', 'tilt_rad',
               'world_vx', 'world_vy', 'loaded_feet', 'loaded_foot_speed_sum', 'termination',
               *['q_'+n for n in names], *['z_'+str(i) for i in range(32)]]
@@ -127,10 +166,11 @@ def main():
         with (args.output/(stem+'_diag.csv')).open('w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
-            for case, (walk_seed, stand_seed, blend) in enumerate(pairs, 1):
+            for case, (walk_seed, target, blend) in enumerate(pairs, 1):
                 start_video = frames/25
                 obs = engine.reset(initial_case(0, cfg, names))
-                walk, stand = Latents(walk_seed, False).next(), Latents(stand_seed, False).next()
+                walk, stand = Latents(walk_seed, False).next(), target['latent']
+                stand_seed = target['seed']
                 blend_steps = round(blend/nominal_dt)
                 rows, switch_xy = [], None
                 for step in range(steps):
@@ -148,6 +188,8 @@ def main():
                     foot_v = task._rigid_body_vel[0, feet, :2].cpu().numpy()
                     loaded = task._contact_forces[0, feet, 2].cpu().numpy() > 5.
                     row = dict(case=case, walk_seed=walk_seed, stand_seed=stand_seed, blend_s=blend,
+                               stand_source=target['source'], stand_clip=target['clip'],
+                               stand_reference_time_s=target['reference_time_s'],
                                step=step+1, time_s=round((step+1)*dt, 6), phase=phase, alpha=alpha,
                                **dict(zip(['base_x', 'base_y', 'base_z', 'local_vx', 'local_vy',
                                            'yaw_rate', 'tilt_rad'], values)),
@@ -160,9 +202,9 @@ def main():
                     rows.append(row)
                     writer.writerow(row)
                     if video and step % 2 == 0:
-                        label = ('F1 ASE epoch{} | case {}/{} | walk z seed {} -> stand z seed {} | blend {:.1f}s\n'
+                        label = ('F1 ASE epoch{} | case {}/{} | walk seed {} -> {} | blend {:.1f}s\n'
                                  '{:.2f}/{}s | {} | alpha={:.2f} | world speed={:.3f}m/s').format(
-                                     actor.epoch, case, len(pairs), walk_seed, stand_seed, blend,
+                                     actor.epoch, case, len(pairs), walk_seed, target['label'], blend,
                                      row['time_s'], args.duration, phase, alpha, np.hypot(root[7], root[8]))
                         video.write(engine.render(), label)
                         frames += 1
@@ -177,6 +219,8 @@ def main():
                 metrics['stationary_at_end'] = bool(completed and metrics['walking_before_switch']
                     and metrics['low_speed_at_end'] and metrics['quiet_legs_at_end'])
                 summary = dict(case=case, walk_seed=walk_seed, stand_seed=stand_seed, blend_s=blend,
+                               stand_source=target['source'], stand_clip=target['clip'],
+                               stand_reference_time_s=target['reference_time_s'],
                                seconds=rows[-1]['time_s'], termination=reasons,
                                video_start_s=start_video, video_end_s=frames/25, **metrics)
                 summaries.append(summary)
@@ -193,6 +237,8 @@ def main():
                   epoch=actor.epoch, seed=args.seed, deterministic=True, init='default_zero_velocity',
                   control_config=actor.control_config, dt=dt, walk_seconds=args.walk_seconds,
                   requested_duration_s=args.duration, interpolation='unit sphere shortest arc',
+                  standing_targets=[dict({k: v for k, v in t.items() if k != 'latent'},
+                                         encoded_z=t['latent'].tolist()) for t in targets],
                   diagnostic_criteria=dict(walking_speed_min=.3, stop_speed_max=.1, stop_hold_s=2,
                     stop_abs_yaw_rate_max=.2, stop_tilt_max=.35, tail_leg_peak_to_peak_max=.1),
                   foot_velocity_note='loaded ankle-roll link XY speed proxy, not contact-point slip; Fz > 5N',
