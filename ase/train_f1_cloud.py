@@ -13,6 +13,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import hashlib
+import shutil
+import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,6 +105,40 @@ def prepare_dependencies(install):
                     raise RuntimeError("F1 dependency installation failed")
     if deps.is_dir():
         sys.path.insert(0, str(deps))
+
+
+def prepare_llc(checkpoint, source_url=None, expected_sha256=None):
+    """Materialize an immutable LLC dependency before importing the simulator.
+
+    Signed URLs stay out of logs and checkpoints. Downloads are verified before
+    replacing the destination, and never written into the training repository.
+    """
+    checkpoint = Path(checkpoint)
+    def digest(path):
+        hasher = hashlib.sha256()
+        with path.open("rb") as file:
+            for block in iter(lambda: file.read(1024*1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()
+    if source_url and not checkpoint.exists():
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        temporary = checkpoint.with_name(checkpoint.name+".download")
+        try:
+            with urllib.request.urlopen(source_url, timeout=120) as response, temporary.open("wb") as target:
+                shutil.copyfileobj(response, target)
+            if expected_sha256 and digest(temporary) != expected_sha256:
+                raise RuntimeError("Downloaded LLC SHA256 mismatch")
+            temporary.replace(checkpoint)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError("LLC download failed; verify source availability") from None
+    if not checkpoint.is_file():
+        raise FileNotFoundError("LLC checkpoint is unavailable")
+    actual = digest(checkpoint)
+    if expected_sha256 and actual != expected_sha256:
+        raise RuntimeError("LLC checkpoint SHA256 mismatch")
+    print("F1_LLC_READY " + json.dumps(dict(bytes=checkpoint.stat().st_size, sha256=actual)), flush=True)
+    return checkpoint
 
 
 def cloud_observer_class(entry, args):
@@ -234,6 +271,8 @@ def main():
     parser.add_argument("--output_path", default="output")
     parser.add_argument("--algorithm", choices=("ase", "amp", "hrl"), default="ase")
     parser.add_argument("--llc-checkpoint", type=Path, help="Frozen ASE model required by F1 HLC")
+    parser.add_argument("--llc-checkpoint-url", help="Optional download URL for a cloud LLC dependency")
+    parser.add_argument("--llc-sha256", help="Expected immutable LLC SHA256")
     parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
     parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
     args, extra = parser.parse_known_args()
@@ -243,6 +282,8 @@ def main():
         parser.error("hrl requires --llc-checkpoint")
     if args.llc_checkpoint:
         args.llc_checkpoint = args.llc_checkpoint.resolve()
+    if args.algorithm == "hrl":
+        args.llc_checkpoint = prepare_llc(args.llc_checkpoint, args.llc_checkpoint_url, args.llc_sha256)
 
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     os.environ.setdefault("MKL_NUM_THREADS", "4")

@@ -107,6 +107,10 @@ python ase/train_f1_cloud.py --algorithm hrl --llc-checkpoint LLC.pt --max_itera
 python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
 ```
 
+Cloud launches can additionally supply `--llc-checkpoint-url` and `--llc-sha256`.
+The entry downloads the dependency to the specified external cache path, verifies
+its hash before use, and excludes the signed URL from its own logs/checkpoints.
+
 Replay writes `isaac_hlc.mp4` and a 50Hz `isaac_hlc.csv` with command, world/body
 velocity, pose, z, task reward and termination. Smoke success verifies the
 engineering path and LLC immutability; it does not establish speed tracking,
