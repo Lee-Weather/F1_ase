@@ -87,6 +87,23 @@ The video labels the reference sequence and final-z hold separately. Tail speed
 statistics cover the last two seconds; an early fall still ends that probe.
 Keep the same prefix when using `--analyze-only` for these saved artifacts.
 
+To test whether known walking and standing latents compose, replay their seed
+pairs from the default pose. This example walks for 3 seconds and then holds the
+standing latent for the remainder of a 10-second rollout, comparing an immediate
+switch with a 0.5-second unit-sphere interpolation. Simulator state is continuous
+across the switch; no optimizer is created:
+
+```bash
+python ase/evaluate_f1_transitions.py --checkpoint LLC.pt --output RESULT --walk-seeds 1002 1026 --stand-seeds 1000 1003 --blend-seconds 0 0.5 --walk-seconds 3 --duration 10 --seed 20261113 --prefix switchstop_
+```
+
+Outputs include one video, a per-step CSV with the applied z, and JSON/CSV case
+summaries. Stopping diagnostics require two continuous seconds at low speed,
+limited turning/tilt, and quiet legs at the end. A stopping distance is reported
+only when a sustained stop occurs. Loaded ankle-link velocity is recorded as a
+foot sliding proxy, not an exact contact-point slip measurement. These tests
+establish behavior for the selected pairs, not for every latent in the LLC.
+
 ### F1 HLC speed control with a frozen ASE LLC
 
 `HumanoidF1HLC` reuses the original HRL/PPO agent. Its actor receives the same
