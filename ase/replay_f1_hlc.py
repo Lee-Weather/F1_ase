@@ -1,4 +1,4 @@
-"""Replay a frozen-LLC F1 HLC with explicit speed commands in Isaac Gym."""
+"""Replay a frozen-LLC F1 HLC with speed commands in Isaac Gym or MuJoCo."""
 import argparse
 import csv
 import math
@@ -7,8 +7,94 @@ from pathlib import Path
 import numpy as np
 
 
+def replay_mujoco(args, speeds):
+    import torch
+    from replay_f1 import MujocoReplay, Video, joint_names, initial_case
+    from utils.f1_hlc import FrozenF1LLC, load_hlc_actor, unit_latent
+
+    torch.set_num_threads(4)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    llc = FrozenF1LLC(args.llc_checkpoint, "cpu")
+    policy, saved = load_hlc_actor(args.checkpoint, llc, "cpu")
+    metadata = saved["training_metadata"]
+    cfg = dict(env=metadata["environment"], sim=metadata["simulation"])
+    dt = cfg["sim"]["dt"] * cfg["env"]["controlFrequencyInv"]
+    interval = saved["hlc_config"]["llc_steps"]
+    if interval != cfg["env"]["hlc"]["llcSteps"]:
+        raise ValueError("Checkpoint task and controller intervals differ")
+    for key, value in llc.control_config.items():
+        if cfg["env"].get(key) != value:
+            raise ValueError("HLC and LLC control configuration differs: " + key)
+    hold_steps = max(1, math.ceil(args.hold_seconds / dt / interval)) * interval
+    cfg["env"]["episodeLength"] = len(speeds) * hold_steps + 1
+    args.output.mkdir(parents=True, exist_ok=True)
+    names = joint_names()
+    engine = MujocoReplay(cfg, names, record_video=not args.no_video)
+    video = None
+    physical_step, hlc_step = 0, 0
+    errors, reasons = [], []
+    try:
+        if not math.isclose(engine.dt, dt, rel_tol=1e-6):
+            raise ValueError("MuJoCo and checkpoint control timesteps differ")
+        engine.reset(initial_case(0, cfg, names))
+        video = Video(args.output / "mujoco_hlc.mp4") if not args.no_video else None
+        with (args.output / "mujoco_hlc.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["hlc_step", "llc_step", "time_s", "target_speed", "world_vx", "world_vy",
+                "base_x", "base_y", "base_z", "body_vx", "body_vy", "body_yaw_rate", "tilt_rad",
+                "task_reward", "termination", *["z_" + str(i) for i in range(32)],
+                *["q_" + n for n in names]])
+            while physical_step < len(speeds) * hold_steps:
+                target = speeds[min(physical_step // hold_steps, len(speeds) - 1)]
+                rot = engine.data.xmat[engine.base].reshape(3, 3)
+                direction = rot.T @ np.array([1., 0., 0.])
+                command = np.array([direction[0], direction[1], target], dtype=np.float32)
+                obs = torch.from_numpy(np.concatenate((engine.obs()[0], command))[None, :])
+                z = unit_latent(policy(obs))
+                hlc_step += 1
+                for _ in range(interval):
+                    action = llc(torch.from_numpy(engine.obs()), z)
+                    _, values, reasons, q = engine.step(action)
+                    physical_step += 1
+                    velocity = np.zeros(6)
+                    engine.mj.mj_objectVelocity(engine.model, engine.data,
+                        engine.mj.mjtObj.mjOBJ_BODY, engine.base, velocity, 0)
+                    vx, vy = velocity[3:5]
+                    facing = engine.data.xmat[engine.base].reshape(3, 3)[0, 0]
+                    hlc = cfg["env"]["hlc"]
+                    reward = math.exp(-hlc["speedTrackingScale"] * (vx - target)**2
+                                      -hlc["lateralTrackingScale"] * vy**2
+                                      -hlc["headingTrackingScale"] * (1 - facing))
+                    errors.append(abs(vx - target))
+                    writer.writerow([hlc_step, physical_step, physical_step * dt, target, vx, vy,
+                        *values, reward, "+".join(reasons), *z[0].tolist(), *q])
+                    if video and ((physical_step - 1) % 2 == 0 or reasons):
+                        label = ("F1 HLC epoch{} | MuJoCo | frozen LLC epoch{} | seed{}\n".format(
+                            saved["epoch"], llc.metadata["epoch"], args.seed)
+                            + "target {:.2f}m/s | vx {:.2f}m/s | {:.2f}s | ".format(
+                                target, vx, physical_step * dt)
+                            + ("+".join(reasons) if reasons else "policy rollout"))
+                        video.write(engine.render(), label)
+                    if reasons:
+                        break
+                if reasons:
+                    break
+        print(dict(engine="mujoco", hlc_epoch=saved["epoch"], llc_epoch=llc.metadata["epoch"],
+                   seed=args.seed, physical_steps=physical_step, hlc_decisions=hlc_step,
+                   seconds=physical_step * dt, speed_mae=float(np.mean(errors)),
+                   termination=reasons), flush=True)
+    finally:
+        try:
+            if video:
+                video.close()
+        finally:
+            engine.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--engine", choices=("gym", "mujoco"), default="gym")
     parser.add_argument("--checkpoint", type=Path, required=True, help="HLC checkpoint")
     parser.add_argument("--llc-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -20,6 +106,8 @@ def main():
     speeds = [float(s) for s in args.speeds.split(",")]
     if not speeds or not np.isfinite(speeds).all() or min(speeds) < 0 or not np.isfinite(args.hold_seconds) or args.hold_seconds <= 0:
         parser.error("speeds must be finite/nonnegative and hold-seconds positive")
+    if args.engine == "mujoco":
+        return replay_mujoco(args, speeds)
     import isaacgym
     import torch
     from replay_f1 import GymReplay, Video, joint_names, initial_case, kinematics

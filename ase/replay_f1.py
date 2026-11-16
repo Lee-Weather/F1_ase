@@ -399,7 +399,17 @@ class MujocoReplay:
 
     def close(self):
         if self.renderer is not None:
-            self.renderer.close()
+            renderer, self.renderer = self.renderer, None
+            if hasattr(renderer, "close"):
+                renderer.close()
+            else:
+                # MuJoCo 2.3.6 predates Renderer.close(). Release the GPU
+                # context while Python and EGL are still initialized.
+                renderer._gl_context.make_current()
+                renderer._mjr_context.free()
+                renderer._mjr_context = None
+                renderer._gl_context.free()
+                renderer._gl_context = None
 
 
 def main():

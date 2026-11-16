@@ -148,6 +148,8 @@ python czy/f1_wbt/scripts/prepare_f1.py --hlc --llc-checkpoint LLC.pt --seed 202
 python ase/train_f1_cloud.py --algorithm hrl --llc-checkpoint LLC.pt --max_iterations 200 --num_envs 4096 --seed 20261113
 # 30s sequence: 1.0 -> 0.6 -> 1.6 -> 1.0m/s; add --no-video for CSV only.
 python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
+# MuJoCo uses the same checkpoints, commands and 50Hz/10Hz control rates.
+python ase/replay_f1_hlc.py --engine mujoco --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
 ```
 
 Cloud launches can additionally supply `--llc-checkpoint-url` and `--llc-sha256`.
