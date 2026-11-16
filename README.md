@@ -121,7 +121,7 @@ and the critic, not appended to the actor. HLC outputs a continuous 32-D latent,
 normalized to unit length, held for five LLC steps (HLC 10Hz / LLC 50Hz).
 
 The initial task starts from the default pose at zero speed and samples target
-speeds in [0.8,1.2]m/s every 5-8 seconds along fixed world +X. Its reward is
+speeds in [0.6,1.6]m/s every 5-8 seconds along fixed world +X. Its reward is
 `exp(-4*(vx-target)^2 - 2*vy^2 - 2*(1-facing_x))`. HLC optimization combines
 0.9 task reward and 0.1 frozen discriminator reward; the encoder is not trained.
 The default timeout is 1500 LLC control steps, or 30 seconds.
@@ -140,7 +140,7 @@ and rewards after termination are excluded.
 python czy/f1_wbt/scripts/prepare_f1.py --hlc --llc-checkpoint LLC.pt --seed 20261113
 # Training entry; choose the run length when scheduling the actual experiment.
 python ase/train_f1_cloud.py --algorithm hrl --llc-checkpoint LLC.pt --max_iterations 200 --num_envs 4096 --seed 20261113
-# 30s sequence: 1.0 -> 0.8 -> 1.2 -> 1.0m/s; add --no-video for CSV only.
+# 30s sequence: 1.0 -> 0.6 -> 1.6 -> 1.0m/s; add --no-video for CSV only.
 python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
 ```
 

@@ -153,6 +153,7 @@ def cloud_observer_class(entry, args):
                 "control_config": task.get_control_config(),
                 "actor_dim": metadata["actor_dim"], "critic_dim": metadata["critic_dim"],
                 "amp_dim": metadata["amp_dim"], "motions": metadata["motions"],
+                "hlc": metadata.get("hlc"),
             }), flush=True)
 
         def process_infos(self, infos, done_indices):

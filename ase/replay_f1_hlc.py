@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True, help="HLC checkpoint")
     parser.add_argument("--llc-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--speeds", default="1.0,0.8,1.2,1.0")
+    parser.add_argument("--speeds", default="1.0,0.6,1.6,1.0")
     parser.add_argument("--hold-seconds", type=float, default=7.5)
     parser.add_argument("--seed", type=int, default=20261113)
     parser.add_argument("--no-video", action="store_true")
