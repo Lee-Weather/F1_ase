@@ -196,6 +196,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
             env_state = weights.get('env_state', None)
             self.vec_env.set_env_state(env_state)
 
+        print('F1_RESUME_RESTORED epoch={} frame={} optimizer_states={}'.format(
+            self.epoch_num, self.frame, len(self.optimizer.state)), flush=True)
         return
 
     def train_epoch(self):

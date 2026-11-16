@@ -107,8 +107,8 @@ def prepare_dependencies(install):
         sys.path.insert(0, str(deps))
 
 
-def prepare_llc(checkpoint, source_url=None, expected_sha256=None):
-    """Materialize an immutable LLC dependency before importing the simulator.
+def prepare_checkpoint(checkpoint, source_url=None, expected_sha256=None, label="LLC"):
+    """Materialize an immutable checkpoint before importing the simulator.
 
     Signed URLs stay out of logs and checkpoints. Downloads are verified before
     replacing the destination, and never written into the training repository.
@@ -127,18 +127,22 @@ def prepare_llc(checkpoint, source_url=None, expected_sha256=None):
             with urllib.request.urlopen(source_url, timeout=120) as response, temporary.open("wb") as target:
                 shutil.copyfileobj(response, target)
             if expected_sha256 and digest(temporary) != expected_sha256:
-                raise RuntimeError("Downloaded LLC SHA256 mismatch")
+                raise RuntimeError("Downloaded {} SHA256 mismatch".format(label))
             temporary.replace(checkpoint)
         except Exception:
             temporary.unlink(missing_ok=True)
-            raise RuntimeError("LLC download failed; verify source availability") from None
+            raise RuntimeError("{} download failed; verify source availability".format(label)) from None
     if not checkpoint.is_file():
-        raise FileNotFoundError("LLC checkpoint is unavailable")
+        raise FileNotFoundError("{} checkpoint is unavailable".format(label))
     actual = digest(checkpoint)
     if expected_sha256 and actual != expected_sha256:
-        raise RuntimeError("LLC checkpoint SHA256 mismatch")
-    print("F1_LLC_READY " + json.dumps(dict(bytes=checkpoint.stat().st_size, sha256=actual)), flush=True)
+        raise RuntimeError("{} checkpoint SHA256 mismatch".format(label))
+    print("F1_{}_READY ".format(label) + json.dumps(dict(bytes=checkpoint.stat().st_size, sha256=actual)), flush=True)
     return checkpoint
+
+
+def prepare_llc(checkpoint, source_url=None, expected_sha256=None):
+    return prepare_checkpoint(checkpoint, source_url, expected_sha256)
 
 
 def cloud_observer_class(entry, args):
@@ -264,7 +268,7 @@ def cloud_observer_class(entry, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--install-deps", action="store_true")
     parser.add_argument("--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=200)
@@ -275,6 +279,9 @@ def main():
     parser.add_argument("--llc-checkpoint", type=Path, help="Frozen ASE model required by F1 HLC")
     parser.add_argument("--llc-checkpoint-url", help="Optional download URL for a cloud LLC dependency")
     parser.add_argument("--llc-sha256", help="Expected immutable LLC SHA256")
+    parser.add_argument("--resume-checkpoint", type=Path, help="Full training state to resume; max_iterations is the total target")
+    parser.add_argument("--resume-checkpoint-url", help="Optional cloud download URL for the full training state")
+    parser.add_argument("--resume-sha256", help="Expected resume checkpoint SHA256")
     parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
     parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
     args, extra = parser.parse_known_args()
@@ -286,6 +293,9 @@ def main():
         args.llc_checkpoint = args.llc_checkpoint.resolve()
     if args.algorithm == "hrl":
         args.llc_checkpoint = prepare_llc(args.llc_checkpoint, args.llc_checkpoint_url, args.llc_sha256)
+    if args.resume_checkpoint:
+        args.resume_checkpoint = prepare_checkpoint(
+            args.resume_checkpoint.resolve(), args.resume_checkpoint_url, args.resume_sha256, label="RESUME")
 
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     os.environ.setdefault("MKL_NUM_THREADS", "4")
@@ -319,6 +329,8 @@ def main():
     ]
     if args.algorithm == "hrl":
         sys.argv += ["--llc_checkpoint", str(args.llc_checkpoint)]
+    if args.resume_checkpoint:
+        sys.argv += ["--resume", "1", "--checkpoint", str(args.resume_checkpoint)]
     entry.main()
 
 
