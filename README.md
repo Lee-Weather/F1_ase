@@ -186,6 +186,17 @@ path length. Quiet means planar speed below 0.05m/s, foot RMS speed below 0.1m/s
 and leg joint RMS velocity below 0.3rad/s. Reaching zero speed alone does not
 establish quiet standing.
 
+For the `exp_f1_8.3` comparison, freeze the final `exp_f1_7.1` LLC instead of
+the original `exp_f1_7` LLC. Keep the same HLC environment, network, reward,
+control rates and optimizer settings as 8.2, and train the HLC from scratch.
+Load the 36-motion manifest belonging to the new LLC; HLC initialization stays
+`Default`, so this does not introduce reference-state resets or retrain its
+discriminator/encoder. Do not resume an 8.2 HLC with a different LLC dependency.
+
+```bash
+python ase/train_f1_cloud.py --algorithm hrl --cfg-env ase/data/cfg/humanoid_f1_hlc_0_2.yaml --motion-file ase/data/motions/f1/dataset_f1_stop_data.yaml --llc-checkpoint LLC_7_1_3000.pt --llc-sha256 f46598d28ebe25dcd08cca56c71636c3ecc7783fe842f9f8df6c8ef12c2cd520 --num_envs 4096 --max_iterations 3000 --seed 20261116 --json-logs
+```
+
 Cloud launches can additionally supply `--llc-checkpoint-url` and `--llc-sha256`.
 The entry downloads the dependency to the specified external cache path, verifies
 its hash before use, and excludes the signed URL from its own logs/checkpoints.
