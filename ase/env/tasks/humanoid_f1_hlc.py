@@ -5,12 +5,19 @@ import torch
 from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 
 from env.tasks.humanoid_f1 import HumanoidF1
+from utils.f1_hlc import speed_task_reward
 
 
 class HumanoidF1HLC(HumanoidF1):
     def __init__(self, cfg, *args, **kwargs):
         self.hlc = cfg["env"]["hlc"]
+        if not 0 <= self.hlc.get("stopProbability", 0.) <= 1:
+            raise ValueError("stopProbability must be in [0, 1]")
         super().__init__(cfg, *args, **kwargs)
+        self._hlc_foot_ids = [self._body_names.index(n) for n in
+                              ("left_ankle_roll_link", "right_ankle_roll_link")]
+        self._hlc_leg_ids = [i for i, n in enumerate(self._dof_names)
+                             if any(part in n for part in ("hip", "knee", "ankle"))]
         self.target_speed = torch.ones(self.num_envs, device=self.device)
         self.command_next_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.target_direction = torch.zeros((self.num_envs, 3), device=self.device)
@@ -27,6 +34,10 @@ class HumanoidF1HLC(HumanoidF1):
     def _sample_commands(self, ids, reset=False):
         low, high = self.hlc["speedRange"]
         self.target_speed[ids] = low + (high-low)*torch.rand(len(ids), device=self.device)
+        stop_probability = self.hlc.get("stopProbability", 0.)
+        if stop_probability:
+            stop = torch.rand(len(ids), device=self.device) < stop_probability
+            self.target_speed[ids[stop]] = 0
         steps = self.hlc["llcSteps"]
         lo, hi = [max(1, math.ceil(s/self.dt/steps)) for s in self.hlc["commandHoldSeconds"]]
         hold = torch.randint(lo, hi+1, (len(ids),), device=self.device)*steps
@@ -58,19 +69,33 @@ class HumanoidF1HLC(HumanoidF1):
         forward = torch.zeros_like(velocity)
         forward[:, 0] = 1
         facing = quat_rotate(self._humanoid_root_states[:, 3:7], forward)[:, 0]
-        error = velocity[:, 0]-self.target_speed
-        self.rew_buf[:] = torch.exp(-self.hlc["speedTrackingScale"]*error.square()
-                                   -self.hlc["lateralTrackingScale"]*velocity[:, 1].square()
-                                   -self.hlc["headingTrackingScale"]*(1-facing))
+        foot_speed_sq, leg_velocity_sq = self._standing_motion()
+        self.rew_buf[:] = speed_task_reward(velocity, facing, self.target_speed,
+                                            foot_speed_sq, leg_velocity_sq, self.hlc)
+
+    def _standing_motion(self):
+        return (self._rigid_body_vel[:, self._hlc_foot_ids].square().sum(-1).mean(-1),
+                self._dof_vel[:, self._hlc_leg_ids].square().mean(-1))
 
     def _compute_reset(self):
         super()._compute_reset()
+        foot_speed_sq, leg_velocity_sq = self._standing_motion()
+        zero = self.target_speed <= 1e-6
+        quiet = (self._humanoid_root_states[:, 7:9].norm(dim=-1) < self.hlc.get("quietPlanarSpeed", .05))
+        quiet &= foot_speed_sq.sqrt() < self.hlc.get("quietFootSpeed", .1)
+        quiet &= leg_velocity_sq.sqrt() < self.hlc.get("quietLegVelocity", .3)
+        quiet &= ~self._terminate_buf.bool()
         self.extras["motion_metrics"].update(
             target_speed_m_s=self.target_speed.clone(),
             forward_speed_m_s=self._humanoid_root_states[:, 7].clone(),
             speed_error_abs_m_s=(self._humanoid_root_states[:, 7]-self.target_speed).abs(),
             lateral_speed_abs_m_s=self._humanoid_root_states[:, 8].abs(),
-            task_reward=self.rew_buf.clone())
+            task_reward=self.rew_buf.clone(),
+            stop_command_fraction=zero.float(),
+            # Both fractions use all samples; their ratio is quiet among zero commands.
+            stop_quiet_fraction=(zero & quiet).float(),
+            foot_speed_rms_m_s=foot_speed_sq.sqrt(),
+            leg_velocity_rms_rad_s=leg_velocity_sq.sqrt())
 
     def get_training_metadata(self):
         result = super().get_training_metadata()

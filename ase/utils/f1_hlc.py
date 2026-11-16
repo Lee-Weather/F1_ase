@@ -11,6 +11,17 @@ from torch.nn import functional as F
 from utils.f1_control import checkpoint_control
 
 
+def speed_task_reward(velocity, facing, target_speed, foot_speed_sq, leg_velocity_sq, config):
+    """Same speed/standing reward in Gym and MuJoCo; standing costs only at zero."""
+    cost = (config["speedTrackingScale"] * (velocity[:, 0] - target_speed).square()
+            + config["lateralTrackingScale"] * velocity[:, 1].square()
+            + config["headingTrackingScale"] * (1 - facing))
+    stop = target_speed <= 1e-6
+    cost += stop * (config.get("standFootSpeedScale", 0.) * foot_speed_sq
+                    + config.get("standLegVelocityScale", 0.) * leg_velocity_sq)
+    return torch.exp(-cost)
+
+
 def unit_latent(value):
     norm = value.norm(dim=-1, keepdim=True)
     fallback = torch.zeros_like(value)

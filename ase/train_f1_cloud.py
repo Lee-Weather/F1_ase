@@ -271,6 +271,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_path", default="output")
     parser.add_argument("--algorithm", choices=("ase", "amp", "hrl"), default="ase")
+    parser.add_argument("--cfg-env", help="Environment YAML relative to the training repository")
     parser.add_argument("--llc-checkpoint", type=Path, help="Frozen ASE model required by F1 HLC")
     parser.add_argument("--llc-checkpoint-url", help="Optional download URL for a cloud LLC dependency")
     parser.add_argument("--llc-sha256", help="Expected immutable LLC SHA256")
@@ -309,7 +310,7 @@ def main():
     sys.argv = [
         str(ROOT / "ase/run.py"), "--task", "HumanoidF1HLC" if args.algorithm == "hrl" else "HumanoidF1", "--headless",
         "--sim_device", "cuda:0", "--pipeline", "gpu", "--rl_device", "cuda:0",
-        "--cfg_env", "ase/data/cfg/humanoid_f1_hlc.yaml" if args.algorithm == "hrl" else "ase/data/cfg/humanoid_f1.yaml",
+        "--cfg_env", args.cfg_env or ("ase/data/cfg/humanoid_f1_hlc.yaml" if args.algorithm == "hrl" else "ase/data/cfg/humanoid_f1.yaml"),
         "--cfg_train", "ase/data/cfg/train/rlg/" + args.algorithm + "_f1.yaml",
         "--motion_file", args.motion_file,
         "--num_envs", str(args.num_envs), "--max_iterations", str(args.max_iterations),

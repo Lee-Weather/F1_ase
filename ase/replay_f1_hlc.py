@@ -1,16 +1,52 @@
 """Replay a frozen-LLC F1 HLC with speed commands in Isaac Gym or MuJoCo."""
 import argparse
 import csv
+import json
 import math
 from pathlib import Path
 
 import numpy as np
 
 
+def replay_summary(path, config):
+    """Summarize command segments, including sustained quiet after a zero command."""
+    with path.open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    segments = []
+    start = 0
+    dt = float(rows[0]["time_s"])
+    for end in range(1, len(rows) + 1):
+        if end < len(rows) and rows[end]["target_speed"] == rows[start]["target_speed"]:
+            continue
+        block = rows[start:end]
+        target = float(block[0]["target_speed"])
+        begin_time = float(block[0]["time_s"]) - dt
+        stable = [r for r in block if float(r["time_s"]) > begin_time + 2]
+        item = dict(target=target, seconds=len(block) * dt,
+                    steady_vx=float(np.mean([float(r["world_vx"]) for r in stable])) if stable else None,
+                    steady_mae=float(np.mean([abs(float(r["world_vx"]) - target) for r in stable])) if stable else None)
+        if target <= 1e-6:
+            quiet_steps, settle = 0, None
+            for row in block:
+                quiet = (math.hypot(float(row["world_vx"]), float(row["world_vy"])) < config.get("quietPlanarSpeed", .05)
+                         and float(row["foot_speed_rms_m_s"]) < config.get("quietFootSpeed", .1)
+                         and float(row["leg_velocity_rms_rad_s"]) < config.get("quietLegVelocity", .3)
+                         and not any(reason in row["termination"] for reason in ("base_height", "base_tilt", "illegal_ground_contact")))
+                quiet_steps = quiet_steps + 1 if quiet else 0
+                if settle is None and quiet_steps * dt >= .5 - 1e-8:
+                    settle = float(row["time_s"]) - begin_time
+            tail = [r for r in block if float(r["time_s"]) > float(block[-1]["time_s"]) - 5]
+            item.update(settle_s=settle, final_quiet_s=quiet_steps * dt,
+                        final5_path_m=sum(math.hypot(float(r["world_vx"]), float(r["world_vy"])) * dt for r in tail))
+        segments.append(item)
+        start = end
+    print("HLC_REPLAY_SEGMENTS " + json.dumps(segments), flush=True)
+
+
 def replay_mujoco(args, speeds):
     import torch
     from replay_f1 import MujocoReplay, Video, joint_names, initial_case
-    from utils.f1_hlc import FrozenF1LLC, load_hlc_actor, unit_latent
+    from utils.f1_hlc import FrozenF1LLC, load_hlc_actor, unit_latent, speed_task_reward
 
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
@@ -31,6 +67,8 @@ def replay_mujoco(args, speeds):
     args.output.mkdir(parents=True, exist_ok=True)
     names = joint_names()
     engine = MujocoReplay(cfg, names, record_video=not args.no_video)
+    feet = [engine.model.body(n).id for n in ("left_ankle_roll_link", "right_ankle_roll_link")]
+    leg_ids = [i for i, n in enumerate(names) if any(part in n for part in ("hip", "knee", "ankle"))]
     video = None
     physical_step, hlc_step = 0, 0
     errors, reasons = [], []
@@ -43,7 +81,8 @@ def replay_mujoco(args, speeds):
             writer = csv.writer(f)
             writer.writerow(["hlc_step", "llc_step", "time_s", "target_speed", "world_vx", "world_vy",
                 "base_x", "base_y", "base_z", "body_vx", "body_vy", "body_yaw_rate", "tilt_rad",
-                "task_reward", "termination", *["z_" + str(i) for i in range(32)],
+                "task_reward", "termination", "foot_speed_rms_m_s", "leg_velocity_rms_rad_s",
+                *["z_" + str(i) for i in range(32)],
                 *["q_" + n for n in names]])
             while physical_step < len(speeds) * hold_steps:
                 target = speeds[min(physical_step // hold_steps, len(speeds) - 1)]
@@ -63,12 +102,21 @@ def replay_mujoco(args, speeds):
                     vx, vy = velocity[3:5]
                     facing = engine.data.xmat[engine.base].reshape(3, 3)[0, 0]
                     hlc = cfg["env"]["hlc"]
-                    reward = math.exp(-hlc["speedTrackingScale"] * (vx - target)**2
-                                      -hlc["lateralTrackingScale"] * vy**2
-                                      -hlc["headingTrackingScale"] * (1 - facing))
+                    foot_velocities = []
+                    for body_id in feet:
+                        foot_velocity = np.zeros(6)
+                        engine.mj.mj_objectVelocity(engine.model, engine.data,
+                            engine.mj.mjtObj.mjOBJ_BODY, body_id, foot_velocity, 0)
+                        foot_velocities.append(foot_velocity[3:])
+                    foot_speed_sq = float(np.square(foot_velocities).sum(-1).mean())
+                    leg_velocity_sq = float(np.square(engine.data.qvel[engine.vids[leg_ids]]).mean())
+                    reward = float(speed_task_reward(
+                        torch.tensor(velocity[None, 3:]), torch.tensor([facing]), torch.tensor([target]),
+                        torch.tensor([foot_speed_sq]), torch.tensor([leg_velocity_sq]), hlc)[0])
                     errors.append(abs(vx - target))
                     writer.writerow([hlc_step, physical_step, physical_step * dt, target, vx, vy,
-                        *values, reward, "+".join(reasons), *z[0].tolist(), *q])
+                        *values, reward, "+".join(reasons), math.sqrt(foot_speed_sq),
+                        math.sqrt(leg_velocity_sq), *z[0].tolist(), *q])
                     if video and ((physical_step - 1) % 2 == 0 or reasons):
                         label = ("F1 HLC epoch{} | MuJoCo | frozen LLC epoch{} | seed{}\n".format(
                             saved["epoch"], llc.metadata["epoch"], args.seed)
@@ -84,6 +132,7 @@ def replay_mujoco(args, speeds):
                    seed=args.seed, physical_steps=physical_step, hlc_decisions=hlc_step,
                    seconds=physical_step * dt, speed_mae=float(np.mean(errors)),
                    termination=reasons), flush=True)
+        replay_summary(args.output / "mujoco_hlc.csv", cfg["env"]["hlc"])
     finally:
         try:
             if video:
@@ -98,12 +147,14 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True, help="HLC checkpoint")
     parser.add_argument("--llc-checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--speeds", default="1.0,0.6,1.6,1.0")
+    parser.add_argument("--protocol", choices=("tracking", "stop-start"), default="tracking")
+    parser.add_argument("--speeds", help="Explicit speeds override --protocol")
     parser.add_argument("--hold-seconds", type=float, default=7.5)
     parser.add_argument("--seed", type=int, default=20261113)
     parser.add_argument("--no-video", action="store_true")
     args = parser.parse_args()
-    speeds = [float(s) for s in args.speeds.split(",")]
+    default_speeds = "0,0.5,1,1.5,2,1,0,0.5,0" if args.protocol == "stop-start" else "1.0,0.6,1.6,1.0"
+    speeds = [float(s) for s in (args.speeds or default_speeds).split(",")]
     if not speeds or not np.isfinite(speeds).all() or min(speeds) < 0 or not np.isfinite(args.hold_seconds) or args.hold_seconds <= 0:
         parser.error("speeds must be finite/nonnegative and hold-seconds positive")
     if args.engine == "mujoco":
@@ -141,7 +192,8 @@ def main():
             writer = csv.writer(f)
             writer.writerow(["hlc_step", "llc_step", "time_s", "target_speed", "world_vx", "world_vy",
                 "base_x", "base_y", "base_z", "body_vx", "body_vy", "body_yaw_rate", "tilt_rad",
-                "task_reward", "termination", *["z_"+str(i) for i in range(32)], *["q_"+n for n in names]])
+                "task_reward", "termination", "foot_speed_rms_m_s", "leg_velocity_rms_rad_s",
+                *["z_"+str(i) for i in range(32)], *["q_"+n for n in names]])
 
             def capture(task, z, action):
                 nonlocal physical_step
@@ -150,9 +202,11 @@ def main():
                 values = kinematics(root[:3], root[[6, 3, 4, 5]], root[7:10], root[10:13])
                 why = [k for k, mask in task.extras["termination_reasons"].items() if bool(mask[0])]
                 target = float(task.target_speed[0])
+                foot_speed_sq, leg_velocity_sq = task._standing_motion()
                 errors.append(abs(root[7]-target))
                 writer.writerow([hlc_step, physical_step, physical_step*dt, target, root[7], root[8],
-                    *values, float(task.rew_buf[0]), "+".join(why), *z[0].cpu().tolist(),
+                    *values, float(task.rew_buf[0]), "+".join(why),
+                    float(foot_speed_sq[0].sqrt()), float(leg_velocity_sq[0].sqrt()), *z[0].cpu().tolist(),
                     *task._dof_pos[0].cpu().tolist()])
                 if video and (physical_step-1) % 2 == 0:
                     label = ("F1 HLC epoch{} | frozen ASE LLC epoch{} | seed{}\n".format(saved["epoch"], llc.metadata["epoch"], args.seed)
@@ -171,6 +225,7 @@ def main():
         print(dict(hlc_epoch=saved["epoch"], llc_epoch=llc.metadata["epoch"], seed=args.seed,
                    physical_steps=physical_step, hlc_decisions=hlc_step, seconds=physical_step*dt,
                    speed_mae=float(np.mean(errors)), termination=[k for k, v in info["termination_reasons"].items() if bool(v[0])]), flush=True)
+        replay_summary(args.output / "isaac_hlc.csv", cfg["env"]["hlc"])
     finally:
         try:
             if video:

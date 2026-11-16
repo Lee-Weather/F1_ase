@@ -152,6 +152,28 @@ python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --outpu
 python ase/replay_f1_hlc.py --engine mujoco --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
 ```
 
+For exp_f1_8.2, select the separate `humanoid_f1_hlc_0_2.yaml` configuration.
+It samples an exact zero-speed command with probability 0.2; the remaining
+commands are uniform in [0,2)m/s. Zero commands additionally penalize mean squared
+foot speed (scale 2) and leg joint velocity (scale 0.05) inside the task reward
+exponent, to distinguish quiet standing from stepping in place. Old HLC configs
+keep their original reward. Training logs include zero-command and quiet-zero
+fractions plus foot/leg RMS speeds. Both fractions use all samples; divide the
+quiet-zero fraction by the zero-command fraction for a conditional quiet rate.
+
+```bash
+python ase/train_f1_cloud.py --algorithm hrl --cfg-env ase/data/cfg/humanoid_f1_hlc_0_2.yaml --llc-checkpoint LLC.pt --max_iterations 3000 --num_envs 4096 --seed 20261116
+# 67.5s: 0 -> 0.5 -> 1 -> 1.5 -> 2 -> 1 -> 0 -> 0.5 -> 0, each 7.5s.
+python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT --protocol stop-start --seed 20261116
+```
+
+`--protocol stop-start` works with either engine. CSVs include foot/leg RMS
+speeds; `HLC_REPLAY_SEGMENTS` reports per-command steady error and zero-command
+settling time (continuous quiet for 0.5s), final quiet duration and final-five-second
+path length. Quiet means planar speed below 0.05m/s, foot RMS speed below 0.1m/s
+and leg joint RMS velocity below 0.3rad/s. Reaching zero speed alone does not
+establish quiet standing.
+
 Cloud launches can additionally supply `--llc-checkpoint-url` and `--llc-sha256`.
 The entry downloads the dependency to the specified external cache path, verifies
 its hash before use, and excludes the signed URL from its own logs/checkpoints.

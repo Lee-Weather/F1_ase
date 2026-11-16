@@ -1,0 +1,10 @@
+extends: humanoid_f1_hlc.yaml
+env:
+  hlc:
+    speedRange: [0.0, 2.0]
+    stopProbability: 0.2  # Explicit zero commands; otherwise uniform in [0, 2).
+    standFootSpeedScale: 2.0
+    standLegVelocityScale: 0.05
+    quietPlanarSpeed: 0.05
+    quietFootSpeed: 0.1
+    quietLegVelocity: 0.3
