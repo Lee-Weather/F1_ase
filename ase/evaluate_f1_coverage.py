@@ -224,6 +224,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, help="Reference manifest for encoder probes and coverage")
     parser.add_argument("--random-cases", type=int, default=64)
     parser.add_argument("--seed", type=int, default=20261113)
     parser.add_argument("--latent-seed", type=int, default=1000)
@@ -255,6 +256,8 @@ def main():
         parser.error("coverage encoder probes require an ASE checkpoint")
     cfg = yaml.safe_load((ROOT / "ase/data/cfg/humanoid_f1.yaml").read_text())
     cfg["env"].update(actor.control_config)
+    if args.dataset is not None:
+        cfg["env"]["motion_file"] = str(args.dataset.resolve())
     # Only the diagnostic timeout changes; physical/control parameters stay intact.
     dt = cfg["sim"]["dt"] * cfg["env"]["controlFrequencyInv"]
     cfg["env"]["episodeLength"] = max(1001, int(np.ceil((args.duration or 0)/dt))+1)

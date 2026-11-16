@@ -87,6 +87,12 @@ The video labels the reference sequence and final-z hold separately. Tail speed
 statistics cover the last two seconds; an early fall still ends that probe.
 Keep the same prefix when using `--analyze-only` for these saved artifacts.
 
+Both coverage and transition diagnostics accept `--dataset MANIFEST.yaml` to
+load a different reference set, for example
+`--dataset ase/data/motions/f1/dataset_f1_stop_data.yaml` for the 36-clip LLC.
+Clip numbers refer to the selected manifest; its new backward-to-stand clip is
+number 29. This selects encoder references without changing the policy or physics.
+
 To test whether known walking and standing latents compose, replay their seed
 pairs from the default pose. This example walks for 3 seconds and then holds the
 standing latent for the remainder of a 10-second rollout, comparing an immediate

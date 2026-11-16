@@ -219,7 +219,7 @@ class GymReplay:
             if hasattr(params.physx, key):
                 setattr(params.physx, key, value)
         cfg["env"].update(numEnvs=num_envs, stateInit="Default", enableCameraSensors=record_video)
-        cfg["env"]["motion_file"] = str(ROOT / "ase/data/motions/f1/dataset_f1.yaml")
+        cfg["env"].setdefault("motion_file", str(ROOT / "ase/data/motions/f1/dataset_f1.yaml"))
         cfg["env"]["asset"]["assetRoot"] = str(ROOT / "ase/data/assets")
         task_class = HumanoidF1HLC if "hlc" in cfg["env"] else HumanoidF1
         self.task = task_class(cfg, params, gymapi.SIM_PHYSX, "cuda", 0, True)

@@ -110,6 +110,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--dataset', type=Path, help='Reference manifest containing the standing clip')
     parser.add_argument('--walk-seeds', type=int, nargs='+', required=True)
     stand = parser.add_mutually_exclusive_group(required=True)
     stand.add_argument('--stand-seeds', type=int, nargs='+')
@@ -142,6 +143,8 @@ def main():
         parser.error('Latent transitions require an ASE checkpoint')
     cfg = yaml.safe_load((ROOT/'ase/data/cfg/humanoid_f1.yaml').read_text())
     cfg['env'].update(actor.control_config)
+    if args.dataset is not None:
+        cfg['env']['motion_file'] = str(args.dataset.resolve())
     nominal_dt = cfg['sim']['dt']*cfg['env']['controlFrequencyInv']
     steps = round(args.duration/nominal_dt)
     switch_step = round(args.walk_seconds/nominal_dt)
