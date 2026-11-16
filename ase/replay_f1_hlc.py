@@ -1,11 +1,74 @@
 """Replay a frozen-LLC F1 HLC with speed commands in Isaac Gym or MuJoCo."""
 import argparse
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
 
 import numpy as np
+
+
+def export_numpy_replay(checkpoint, llc_checkpoint, policy_npz, llc_policy_npz):
+    """Export the two deterministic actors on a host with working PyTorch."""
+    from replay_f1 import export_actor_npz
+    from utils.f1_hlc import FrozenF1LLC, load_hlc_actor
+    llc = FrozenF1LLC(llc_checkpoint, "cpu")
+    _, saved = load_hlc_actor(checkpoint, llc, "cpu")
+    metadata = {key: saved[key] for key in
+                ("epoch", "training_metadata", "hlc_config", "llc_dependency", "control_config")}
+    weights = {key[len("a2c_network."):]: value.detach().float().numpy()
+               for key, value in saved["model"].items()
+               if key.startswith(("a2c_network.actor_mlp.", "a2c_network.mu."))}
+    weights.update(mean=saved["running_mean_std"]["running_mean"].float().numpy(),
+                   scale=np.sqrt(saved["running_mean_std"]["running_var"].float().numpy() + 1e-5),
+                   metadata=np.array(json.dumps(metadata)),
+                   source_sha256=np.array(hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()))
+    np.savez_compressed(policy_npz, **weights)
+    export_actor_npz(llc_checkpoint, llc_policy_npz)
+
+
+def load_numpy_replay(checkpoint, llc_checkpoint, policy_npz, llc_policy_npz):
+    """Load source-bound NumPy actors without importing PyTorch."""
+    from replay_f1 import load_actor_numpy
+    with np.load(policy_npz, allow_pickle=False) as archive:
+        weights = {key: archive[key] for key in archive.files}
+    saved = json.loads(str(weights["metadata"]))
+    if hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest() != str(weights["source_sha256"]):
+        raise ValueError("NumPy HLC weights belong to a different checkpoint")
+    llc = load_actor_numpy(llc_policy_npz)
+    expected = saved["llc_dependency"]["sha256"]
+    if llc.source_sha256 != expected or hashlib.sha256(Path(llc_checkpoint).read_bytes()).hexdigest() != expected:
+        raise ValueError("NumPy HLC checkpoint requires a different LLC")
+    llc.metadata = saved["llc_dependency"]
+    layers = sorted(int(key.split(".")[1]) for key in weights
+                    if key.startswith("actor_mlp.") and key.endswith(".weight"))
+
+    def policy(obs):
+        hidden = np.clip((np.asarray(obs, dtype=np.float32) - weights["mean"]) / weights["scale"], -5, 5)
+        for index in layers:
+            name = "actor_mlp." + str(index)
+            hidden = np.maximum(hidden @ weights[name + ".weight"].T + weights[name + ".bias"], 0)
+        return np.tanh(hidden @ weights["mu.weight"].T + weights["mu.bias"])
+
+    return llc, policy, saved
+
+
+def numpy_unit_latent(value):
+    norm = np.linalg.norm(value, axis=-1, keepdims=True)
+    fallback = np.zeros_like(value)
+    fallback[..., 0] = 1
+    return np.where(norm > 1e-8, value / np.maximum(norm, 1e-8), fallback)
+
+
+def numpy_task_reward(velocity, facing, target, foot_speed_sq, leg_velocity_sq, config):
+    cost = (config["speedTrackingScale"] * (velocity[0] - target) ** 2
+            + config["lateralTrackingScale"] * velocity[1] ** 2
+            + config["headingTrackingScale"] * (1 - facing))
+    if target <= 1e-6:
+        cost += (config.get("standFootSpeedScale", 0.) * foot_speed_sq
+                 + config.get("standLegVelocityScale", 0.) * leg_velocity_sq)
+    return float(np.exp(-cost))
 
 
 def replay_summary(path, config):
@@ -44,15 +107,19 @@ def replay_summary(path, config):
 
 
 def replay_mujoco(args, speeds):
-    import torch
     from replay_f1 import MujocoReplay, Video, joint_names, initial_case
-    from utils.f1_hlc import FrozenF1LLC, load_hlc_actor, unit_latent, speed_task_reward
 
-    torch.set_num_threads(4)
-    torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    llc = FrozenF1LLC(args.llc_checkpoint, "cpu")
-    policy, saved = load_hlc_actor(args.checkpoint, llc, "cpu")
+    if args.policy_npz:
+        llc, policy, saved = load_numpy_replay(
+            args.checkpoint, args.llc_checkpoint, args.policy_npz, args.llc_policy_npz)
+    else:
+        import torch
+        from utils.f1_hlc import FrozenF1LLC, load_hlc_actor, unit_latent, speed_task_reward
+        torch.set_num_threads(4)
+        torch.manual_seed(args.seed)
+        llc = FrozenF1LLC(args.llc_checkpoint, "cpu")
+        policy, saved = load_hlc_actor(args.checkpoint, llc, "cpu")
     metadata = saved["training_metadata"]
     cfg = dict(env=metadata["environment"], sim=metadata["simulation"])
     dt = cfg["sim"]["dt"] * cfg["env"]["controlFrequencyInv"]
@@ -89,11 +156,12 @@ def replay_mujoco(args, speeds):
                 rot = engine.data.xmat[engine.base].reshape(3, 3)
                 direction = rot.T @ np.array([1., 0., 0.])
                 command = np.array([direction[0], direction[1], target], dtype=np.float32)
-                obs = torch.from_numpy(np.concatenate((engine.obs()[0], command))[None, :])
-                z = unit_latent(policy(obs))
+                obs = np.concatenate((engine.obs()[0], command))[None, :]
+                z = (numpy_unit_latent(policy(obs)) if args.policy_npz else
+                     unit_latent(policy(torch.from_numpy(obs))))
                 hlc_step += 1
                 for _ in range(interval):
-                    action = llc(torch.from_numpy(engine.obs()), z)
+                    action = llc(engine.obs() if args.policy_npz else torch.from_numpy(engine.obs()), z)
                     _, values, reasons, q = engine.step(action)
                     physical_step += 1
                     velocity = np.zeros(6)
@@ -110,9 +178,12 @@ def replay_mujoco(args, speeds):
                         foot_velocities.append(foot_velocity[3:])
                     foot_speed_sq = float(np.square(foot_velocities).sum(-1).mean())
                     leg_velocity_sq = float(np.square(engine.data.qvel[engine.vids[leg_ids]]).mean())
-                    reward = float(speed_task_reward(
-                        torch.tensor(velocity[None, 3:]), torch.tensor([facing]), torch.tensor([target]),
-                        torch.tensor([foot_speed_sq]), torch.tensor([leg_velocity_sq]), hlc)[0])
+                    if args.policy_npz:
+                        reward = numpy_task_reward(velocity[3:], facing, target, foot_speed_sq, leg_velocity_sq, hlc)
+                    else:
+                        reward = float(speed_task_reward(
+                            torch.tensor(velocity[None, 3:]), torch.tensor([facing]), torch.tensor([target]),
+                            torch.tensor([foot_speed_sq]), torch.tensor([leg_velocity_sq]), hlc)[0])
                     errors.append(abs(vx - target))
                     writer.writerow([hlc_step, physical_step, physical_step * dt, target, vx, vy,
                         *values, reward, "+".join(reasons), math.sqrt(foot_speed_sq),
@@ -146,6 +217,8 @@ def main():
     parser.add_argument("--engine", choices=("gym", "mujoco"), default="gym")
     parser.add_argument("--checkpoint", type=Path, required=True, help="HLC checkpoint")
     parser.add_argument("--llc-checkpoint", type=Path, required=True)
+    parser.add_argument("--policy-npz", type=Path, help="Exported HLC actor for MuJoCo without PyTorch")
+    parser.add_argument("--llc-policy-npz", type=Path, help="Exported matching LLC actor; requires --policy-npz")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--protocol", choices=("tracking", "stop-start"), default="tracking")
     parser.add_argument("--speeds", help="Explicit speeds override --protocol")
@@ -153,6 +226,10 @@ def main():
     parser.add_argument("--seed", type=int, default=20261113)
     parser.add_argument("--no-video", action="store_true")
     args = parser.parse_args()
+    if bool(args.policy_npz) != bool(args.llc_policy_npz):
+        parser.error("--policy-npz and --llc-policy-npz must be supplied together")
+    if args.policy_npz and args.engine != "mujoco":
+        parser.error("NumPy actors are supported with mujoco only")
     default_speeds = "0,0.5,1,1.5,2,1,0,0.5,0" if args.protocol == "stop-start" else "1.0,0.6,1.6,1.0"
     speeds = [float(s) for s in (args.speeds or default_speeds).split(",")]
     if not speeds or not np.isfinite(speeds).all() or min(speeds) < 0 or not np.isfinite(args.hold_seconds) or args.hold_seconds <= 0:

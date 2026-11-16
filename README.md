@@ -152,6 +152,18 @@ python ase/replay_f1_hlc.py --checkpoint HLC.pth --llc-checkpoint LLC.pt --outpu
 python ase/replay_f1_hlc.py --engine mujoco --checkpoint HLC.pth --llc-checkpoint LLC.pt --output RESULT
 ```
 
+For a MuJoCo host without working PyTorch, export both deterministic actors on
+a PyTorch host, then copy the two NPZ files alongside the original checkpoints:
+
+```bash
+PYTHONPATH=ase python -c "from replay_f1_hlc import export_numpy_replay; export_numpy_replay('HLC.pth', 'LLC.pt', 'hlc_actor.npz', 'llc_actor.npz')"
+python ase/replay_f1_hlc.py --engine mujoco --checkpoint HLC.pth --llc-checkpoint LLC.pt --policy-npz hlc_actor.npz --llc-policy-npz llc_actor.npz --output RESULT
+```
+
+The NumPy path preserves HLC tanh outputs, unit latents, LLC normalization and
+action clipping. It checks the source checkpoint hashes and the frozen LLC
+dependency before replay. The default PyTorch replay path remains available.
+
 For exp_f1_8.2, select the separate `humanoid_f1_hlc_0_2.yaml` configuration.
 It samples an exact zero-speed command with probability 0.2; the remaining
 commands are uniform in [0,2)m/s. Zero commands additionally penalize mean squared

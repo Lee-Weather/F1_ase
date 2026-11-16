@@ -6,6 +6,7 @@ Outputs are one two-view video and one CSV per engine.
 """
 import argparse
 import csv
+import hashlib
 import itertools
 import inspect
 import json
@@ -96,7 +97,8 @@ def export_actor_npz(checkpoint, destination):
     weights.update(mean=ckpt["running_mean_std"]["running_mean"].float().numpy(),
                    scale=np.sqrt(ckpt["running_mean_std"]["running_var"].float().numpy() + 1e-5),
                    epoch=np.array(ckpt["epoch"]),
-                   control_config=np.array(json.dumps(checkpoint_control(ckpt))))
+                   control_config=np.array(json.dumps(checkpoint_control(ckpt))),
+                   source_sha256=np.array(hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()))
     np.savez_compressed(destination, **weights)
 
 
@@ -128,6 +130,7 @@ def load_actor_numpy(path):
     actor.epoch = int(weights["epoch"])
     actor.algorithm = "ASE" if is_ase else "AMP"
     actor.control_config = json.loads(str(weights["control_config"]))
+    actor.source_sha256 = str(weights.get("source_sha256", ""))
     return actor
 
 
