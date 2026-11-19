@@ -1,4 +1,4 @@
-# F1 HLC: frozen exp_f1_7 ASE LLC; 50Hz LLC / 10Hz HLC.
+# F1 HLC: frozen ASE LLC bound by checkpoint SHA256; 50Hz LLC / 10Hz HLC.
 params:
   seed: -1
   algo:

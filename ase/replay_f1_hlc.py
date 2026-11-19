@@ -9,6 +9,14 @@ from pathlib import Path
 import numpy as np
 
 
+PROTOCOL_SPEEDS = {
+    "tracking": "1.0,0.6,1.6,1.0",
+    "stop-start": "0,0.5,1,1.5,2,1,0,0.5,0",
+    "low-speed": "0,0.2,0.3,0.5,0.3,0.2,0,0.3,0",
+    "decel-restart": "1,0.5,0.2,0,0.2,0.5,1",
+}
+
+
 def export_numpy_replay(checkpoint, llc_checkpoint, policy_npz, llc_policy_npz):
     """Export the two deterministic actors on a host with working PyTorch."""
     from replay_f1 import export_actor_npz
@@ -220,9 +228,9 @@ def main():
     parser.add_argument("--policy-npz", type=Path, help="Exported HLC actor for MuJoCo without PyTorch")
     parser.add_argument("--llc-policy-npz", type=Path, help="Exported matching LLC actor; requires --policy-npz")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--protocol", choices=("tracking", "stop-start"), default="tracking")
+    parser.add_argument("--protocol", choices=tuple(PROTOCOL_SPEEDS), default="tracking")
     parser.add_argument("--speeds", help="Explicit speeds override --protocol")
-    parser.add_argument("--hold-seconds", type=float, default=7.5)
+    parser.add_argument("--hold-seconds", type=float, help="Default 10s for low-speed/decel-restart, otherwise 7.5s")
     parser.add_argument("--seed", type=int, default=20261113)
     parser.add_argument("--no-video", action="store_true")
     args = parser.parse_args()
@@ -230,7 +238,9 @@ def main():
         parser.error("--policy-npz and --llc-policy-npz must be supplied together")
     if args.policy_npz and args.engine != "mujoco":
         parser.error("NumPy actors are supported with mujoco only")
-    default_speeds = "0,0.5,1,1.5,2,1,0,0.5,0" if args.protocol == "stop-start" else "1.0,0.6,1.6,1.0"
+    default_speeds = PROTOCOL_SPEEDS[args.protocol]
+    if args.hold_seconds is None:
+        args.hold_seconds = 10. if args.protocol in ("low-speed", "decel-restart") else 7.5
     speeds = [float(s) for s in (args.speeds or default_speeds).split(",")]
     if not speeds or not np.isfinite(speeds).all() or min(speeds) < 0 or not np.isfinite(args.hold_seconds) or args.hold_seconds <= 0:
         parser.error("speeds must be finite/nonnegative and hold-seconds positive")

@@ -6,6 +6,7 @@ from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 
 from env.tasks.humanoid_f1 import HumanoidF1
 from utils.f1_hlc import speed_task_reward
+from utils.f1_hlc_metrics import HLCMetrics
 
 
 class HumanoidF1HLC(HumanoidF1):
@@ -22,6 +23,7 @@ class HumanoidF1HLC(HumanoidF1):
         self.command_next_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.target_direction = torch.zeros((self.num_envs, 3), device=self.device)
         self.target_direction[:, 0] = 1  # Fixed world heading, not a rotating body-forward goal.
+        self.hlc_metrics = HLCMetrics(self.num_envs, self.device, self.dt, self.hlc)
 
     def _setup_character_props(self, key_bodies):
         super()._setup_character_props(key_bodies)
@@ -45,6 +47,8 @@ class HumanoidF1HLC(HumanoidF1):
 
     def _reset_envs(self, env_ids):
         if len(env_ids):
+            if hasattr(self, "hlc_metrics"):
+                self.hlc_metrics.reset(env_ids)
             self._sample_commands(env_ids, reset=True)
         super()._reset_envs(env_ids)
 

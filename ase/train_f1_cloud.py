@@ -179,6 +179,11 @@ def cloud_observer_class(entry, args):
                 if values.numel():
                     total, count = self._motion_totals.get(name, (0, 0))
                     self._motion_totals[name] = (total + values.sum().detach(), count + values.numel())
+            if "hlc_metrics" in infos:
+                if not hasattr(self, "_hlc_totals"):
+                    self._hlc_totals = {}
+                for name, value in infos["hlc_metrics"].items():
+                    self._hlc_totals[name] = self._hlc_totals.get(name, 0) + value.detach()
 
         def after_print_stats(self, frame, epoch_num, total_time):
             super().after_print_stats(frame, epoch_num, total_time)
@@ -209,6 +214,22 @@ def cloud_observer_class(entry, args):
                 self.writer.add_scalar(name, value, frame)
             self._motion_totals = {}
             result["motion"] = self._last_motion_metrics
+            self._last_hlc_metrics = {}
+            if hasattr(self, "_hlc_totals"):
+                from utils.f1_hlc_metrics import summarize_hlc_metrics
+                self._last_hlc_metrics = summarize_hlc_metrics(
+                    {name: float(value) for name, value in self._hlc_totals.items()})
+                self._hlc_totals = {}
+                task = self.algo.vec_env.env.task
+                for name, count in task.hlc_metrics.pending().items():
+                    self._last_hlc_metrics["HLC_Events/" + name + "_pending"] = count
+                for name, value in self._last_hlc_metrics.items():
+                    self.writer.add_scalar(name, value, frame)
+                result["hlc"] = self._last_hlc_metrics
+            if epoch_num in getattr(args, "archive_iterations", ()):
+                name = self.algo.config["name"] + "_" + str(epoch_num).zfill(8)
+                self.algo.save(str(Path(self.algo.nn_dir) / name))
+                print("F1_CHECKPOINT_ARCHIVE " + json.dumps({"epoch": epoch_num, "file": name + ".pth"}), flush=True)
 
         def format_train_stats(self, train_info, epoch_num, frame, total_time):
             if not hasattr(self, "_iteration_times"):
@@ -216,6 +237,7 @@ def cloud_observer_class(entry, args):
             self._iteration_times.append(train_info["total_time"])
             metrics = {}
             metrics.update(self._last_motion_metrics)
+            metrics.update(self._last_hlc_metrics)
             sigmas = self.algo.experience_buffer.tensor_dict.get("sigmas")
             if sigmas is not None:
                 metrics["Mean action noise std"] = mean_metric(sigmas)
@@ -284,9 +306,13 @@ def main():
     parser.add_argument("--resume-sha256", help="Expected resume checkpoint SHA256")
     parser.add_argument("--motion-file", default="ase/data/motions/f1/dataset_f1.yaml")
     parser.add_argument("--json-logs", action="store_true", help="Also emit F1_TRAIN JSON lines for automation")
+    parser.add_argument("--archive-iterations", type=int, nargs="+", default=[],
+                        help="Keep named checkpoints at these epochs, in addition to the rolling latest model")
     args, extra = parser.parse_known_args()
     if args.max_iterations < 1 or args.num_envs < 1:
         parser.error("max_iterations and num_envs must be positive")
+    if any(epoch < 1 or epoch > args.max_iterations for epoch in args.archive_iterations):
+        parser.error("archive iterations must be within 1..max_iterations")
     if args.algorithm == "hrl" and not args.llc_checkpoint:
         parser.error("hrl requires --llc-checkpoint")
     if args.llc_checkpoint:
@@ -316,6 +342,7 @@ def main():
         "num_envs": args.num_envs, "max_iterations": args.max_iterations,
         "seed": args.seed, "control_hz": 50,
         "algorithm": args.algorithm, "motion_file": args.motion_file,
+        "archive_iterations": args.archive_iterations,
     }), flush=True)
     sys.argv = [
         str(ROOT / "ase/run.py"), "--task", "HumanoidF1HLC" if args.algorithm == "hrl" else "HumanoidF1", "--headless",
