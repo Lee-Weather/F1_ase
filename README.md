@@ -6,15 +6,18 @@
 
 ## 当前进展
 
-截至2026-11-17，**exp_f1_8.2的2850轮HLC作为当前调速主基线，850轮模型保留为停稳对照；exp_f1_8.3用于对比7.1 LLC。** 两轮HLC任务均已终止，未完成原定3000轮。Gym调速有效，完整双引擎站走停尚未通过。
+截至2026-11-20，**exp_f1_8.2的2850轮HLC作为当前调速主基线，850轮保留为停稳对照；8.3/8.4分别对比7.1与7.2-3000 LLC，8.5准备使用7.2-6000 LLC。** 8.2～8.4均未完成原定3000轮，8.5使用6000轮LLC进行1800轮HLC对照。Gym调速有效，完整双引擎站走停尚未通过。
 
 | 实验 | 模型与用途 | 已验证结果 |
 |---|---|---|
 | exp_f1_7 | 24段参考训练ASE LLC，3000轮 | 部分latent可自主起步和持续行走；完整参考技能覆盖及走→停未通过 |
 | exp_f1_7.1 | 36段参考、增强停步数据的ASE LLC，3000轮 | Gym行走/静站可用；12组所测走→站立latent切换均未停稳 |
 | exp_f1_7.2 | 原24段＋8段慢走/过渡参考的ASE LLC，3000轮 | 88组Gym诊断部分达标：出现较慢自主步态，但0.2～0.5m/s稳态覆盖待验证，有效固定z走停0/7 |
+| exp_f1_7.2-6000 | 同一32段LLC由3000轮续训至6000轮 | 92组Gym诊断部分达标：固定z持续前进14/64，出现末5秒约0.4m/s步态；重筛组合有效走停1/4、再起步0/1 |
 | exp_f1_8.2 | 冻结原7 LLC；最新保存HLC为2850轮，末日志2854轮 | Gym完整67.5秒无跌倒，速度MAE 0.06895m/s；最后停步末5秒路径10.24cm，略超10cm阈值；本机MuJoCo在52.7秒再起步时失稳 |
 | exp_f1_8.3 | 冻结7.1 LLC；最新保存HLC为1700轮，末日志1704轮 | Gym完整67.5秒无跌倒，速度MAE 0.07043m/s；首次1→0未停稳，末次0.5→0通过本次停稳阈值；本机MuJoCo在初始零速段4.6秒失稳 |
+| exp_f1_8.4 | 冻结7.2的3000轮LLC；最新保存HLC为1800轮，末日志1829轮 | Gym完整67.5秒，速度MAE 0.07129m/s，两次走停阈值未通过；本机MuJoCo首次起步9.54秒失稳 |
+| exp_f1_8.5 | 冻结7.2的6000轮LLC；从零训练1800轮HLC | 保持8.4高层任务及优化参数，重点与8.4的1800轮模型比较；启动状态和结果见工作区实验记录 |
 
 8.2的850轮与2850轮在相同协议下，Gym速度MAE由0.08189降至0.06895m/s，下降约15.8%；但最后停步路径由3.56cm增至10.24cm，停稳能力没有随轮数全面改善。两模型是450轮后分开的训练分支。8.2与8.3的HLC训练轮数也不同，不能仅凭这些单seed回放判定新增参考数据或7.1 LLC本身更差。
 
@@ -137,13 +140,23 @@ python ase/train_f1_cloud.py --algorithm hrl --cfg-env ase/data/cfg/humanoid_f1_
 
 ### exp_f1_8.4：基于7.2 LLC的低速与站走停对照
 
-8.4保持8.2的命令分布、奖励、网络和物理参数，冻结7.2最终LLC，从零训练HLC。当前为工程准备阶段，正式训练/完整技能验收须在开始前通知。32段数据清单为`dataset_f1_7_2.yaml`，不是7.1的36段或撤回的7.3方案；模型SHA256绑定防止混用依赖。
+8.4保持8.2的命令分布、奖励、网络和物理参数，冻结7.2的3000轮LLC，从零训练HLC；实际训练和回放结果见上表。32段数据清单为`dataset_f1_7_2.yaml`，不是7.1的36段或撤回的7.3方案；模型SHA256绑定防止混用依赖。
 
 ```bash
 python ase/train_f1_cloud.py --algorithm hrl --cfg-env ase/data/cfg/humanoid_f1_hlc_0_2.yaml --motion-file ase/data/motions/f1/dataset_f1_7_2.yaml --llc-checkpoint ../czy/data/exp_f1_7.2/model_3000.pt --llc-sha256 5f0f31d3a1d998c9195d391002ca8f43bc69ccacd301a0b49b348c32fec5e88e --num_envs 4096 --max_iterations 3000 --archive-iterations 850 1700 2850 3000 --seed 20261116 --json-logs
 ```
 
 `--archive-iterations`只在指定轮数增加命名checkpoint，保留原每50轮覆盖式最新保存；例如`F1_HLC_00000850.pth`用于同轮数对照。它不改变优化步数或奖励，也不恢复旧HLC。
+
+### exp_f1_8.5：冻结7.2的6000轮LLC
+
+8.5替换为`exp_f1_7.2/model_6000.pt`，固定SHA256为`1d55ac95f1603eb16e069a5aeaf5a47d956a928e3fb7e70e61c3d8fcc7ab12ed`。数据清单、动作映射、PD、HLC网络、0～2m/s/20%零速命令、奖励和PPO设置与8.4一致。HLC从零训练，不能加载8.4 HLC或将其依赖直接改为6000轮LLC；6000轮后的latent语义和归一化已变化。
+
+```bash
+python ase/train_f1_cloud.py --algorithm hrl --cfg-env ase/data/cfg/humanoid_f1_hlc_0_2.yaml --motion-file ase/data/motions/f1/dataset_f1_7_2.yaml --llc-checkpoint ../czy/data/exp_f1_7.2/model_6000.pt --llc-sha256 1d55ac95f1603eb16e069a5aeaf5a47d956a928e3fb7e70e61c3d8fcc7ab12ed --num_envs 4096 --max_iterations 1800 --archive-iterations 850 1700 1800 --seed 20261116 --json-logs
+```
+
+用户指定8.5从零训练1800轮HLC，保留850/1700/1800轮命名模型，与8.4实际保存的1800轮做同预算回放。现有入口无需增加新算法或独立启动脚本；Flux入口仍是`gm-run F1_ase/ase/train_f1_cloud.py`，hparams为`F1_ase/ase/data/cfg/train/rlg/hrl_f1.yaml`，云端缓存模型使用独立的6000轮文件名。正式训练/完整技能验收开始前通知，账号与云任务在正式启动时另行确定。
 
 续训时增加`--resume-checkpoint HLC.pt`，保留匹配的LLC、环境和参考清单。它恢复HLC模型、归一化、Adam和轮次等训练状态；`--max_iterations`表示总目标轮数，例如450轮恢复到总3000轮。仿真环境重新初始化，不表示恢复原容器的连续物理状态。
 
