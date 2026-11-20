@@ -112,6 +112,8 @@ class HRLAgent(common_agent.CommonAgent):
         return clamped_actions
 
     def play_steps(self):
+        if self.config.get('frozen_f1_llc', False):
+            self.vec_env.env.task.set_training_epoch(self.epoch_num)
         self.set_eval()
         
         epinfos = []

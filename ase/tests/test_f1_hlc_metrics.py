@@ -103,8 +103,11 @@ class MetricsTests(unittest.TestCase):
                      torch.zeros(6, dtype=torch.bool), torch.zeros(6, dtype=torch.bool))
         totals = {key: float(value) for key, value in metrics.drain().items()}
         summary = summarize_hlc_metrics(totals)
-        for band, _, _ in metrics.SPEED_BANDS:
+        for band, _, _ in metrics.SPEED_BANDS[:5]:
             self.assertEqual(summary["HLC_Speed/" + band + "/samples"], 1)
+        self.assertEqual(summary["HLC_Speed/near_0p1/samples"], 0)
+        self.assertEqual(summary["HLC_Speed/near_0p2/samples"], 1)
+        self.assertEqual(summary["HLC_Speed/near_0p3/samples"], 0)
         self.assertAlmostEqual(summary["HLC_Speed/0_0p5/mae_m_s"], .1)
         self.assertEqual(summary["HLC_Events/zero_quiet_fraction"], 1)
         self.assertNotIn("HLC_Events/stop_success_rate", summary)

@@ -7,11 +7,13 @@ from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 from env.tasks.humanoid_f1 import HumanoidF1
 from utils.f1_hlc import speed_task_reward
 from utils.f1_hlc_metrics import HLCMetrics
+from utils.f1_hlc_curriculum import command_stage
 
 
 class HumanoidF1HLC(HumanoidF1):
     def __init__(self, cfg, *args, **kwargs):
         self.hlc = cfg["env"]["hlc"]
+        self.training_epoch = 0
         if not 0 <= self.hlc.get("stopProbability", 0.) <= 1:
             raise ValueError("stopProbability must be in [0, 1]")
         super().__init__(cfg, *args, **kwargs)
@@ -34,9 +36,16 @@ class HumanoidF1HLC(HumanoidF1):
         return 3
 
     def _sample_commands(self, ids, reset=False):
-        low, high = self.hlc["speedRange"]
+        _, stage = command_stage(self.hlc, self.training_epoch)
+        low, high = stage["speedRange"]
         self.target_speed[ids] = low + (high-low)*torch.rand(len(ids), device=self.device)
-        stop_probability = self.hlc.get("stopProbability", 0.)
+        anchors = stage.get("speedAnchors", [])
+        if anchors:
+            selected = torch.rand(len(ids), device=self.device) < stage.get("anchorProbability", 0.)
+            values = torch.tensor(anchors, dtype=self.target_speed.dtype, device=self.device)
+            chosen = torch.randint(len(anchors), (len(ids),), device=self.device)
+            self.target_speed[ids[selected]] = values[chosen[selected]]
+        stop_probability = stage.get("stopProbability", 0.)
         if stop_probability:
             stop = torch.rand(len(ids), device=self.device) < stop_probability
             self.target_speed[ids[stop]] = 0
@@ -44,6 +53,11 @@ class HumanoidF1HLC(HumanoidF1):
         lo, hi = [max(1, math.ceil(s/self.dt/steps)) for s in self.hlc["commandHoldSeconds"]]
         hold = torch.randint(lo, hi+1, (len(ids),), device=self.device)*steps
         self.command_next_step[ids] = hold if reset else self.progress_buf[ids]+hold
+
+    def set_training_epoch(self, epoch):
+        # Preserve an already-issued command until its normal expiry. This also
+        # avoids changing the actor observation behind the PPO rollout buffer.
+        self.training_epoch = int(epoch)
 
     def _reset_envs(self, env_ids):
         if len(env_ids):
@@ -100,6 +114,9 @@ class HumanoidF1HLC(HumanoidF1):
             stop_quiet_fraction=(zero & quiet).float(),
             foot_speed_rms_m_s=foot_speed_sq.sqrt(),
             leg_velocity_rms_rad_s=leg_velocity_sq.sqrt())
+        if self.hlc.get("commandCurriculum"):
+            stage, _ = command_stage(self.hlc, self.training_epoch)
+            self.extras["motion_metrics"]["curriculum_stage"] = torch.full_like(self.target_speed, stage)
 
     def get_training_metadata(self):
         result = super().get_training_metadata()

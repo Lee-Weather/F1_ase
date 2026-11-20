@@ -70,13 +70,21 @@ def numpy_unit_latent(value):
 
 
 def numpy_task_reward(velocity, facing, target, foot_speed_sq, leg_velocity_sq, config):
-    cost = (config["speedTrackingScale"] * (velocity[0] - target) ** 2
-            + config["lateralTrackingScale"] * velocity[1] ** 2
+    speed_scale = config["speedTrackingScale"]
+    lateral_scale = config["lateralTrackingScale"]
+    if "movingSpeedSigmaMin" in config:
+        sigma = config["standingSpeedSigma"] if target <= 1e-6 else max(config["movingSpeedSigmaMin"], target * config["movingSpeedSigmaFraction"])
+        speed_scale = 1 / sigma ** 2
+        if target <= 1e-6:
+            lateral_scale = speed_scale
+    cost = (speed_scale * (velocity[0] - target) ** 2
+            + lateral_scale * velocity[1] ** 2
             + config["headingTrackingScale"] * (1 - facing))
     if target <= 1e-6:
         cost += (config.get("standFootSpeedScale", 0.) * foot_speed_sq
                  + config.get("standLegVelocityScale", 0.) * leg_velocity_sq)
-    return float(np.exp(-cost))
+    progress = np.clip(velocity[0] / max(target, 1e-6), 0, 1) if config.get("requireForwardProgress", False) and target > 1e-6 else 1.
+    return float(np.exp(-cost) * progress)
 
 
 def replay_summary(path, config):

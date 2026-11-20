@@ -13,13 +13,25 @@ from utils.f1_control import checkpoint_control
 
 def speed_task_reward(velocity, facing, target_speed, foot_speed_sq, leg_velocity_sq, config):
     """Same speed/standing reward in Gym and MuJoCo; standing costs only at zero."""
-    cost = (config["speedTrackingScale"] * (velocity[:, 0] - target_speed).square()
-            + config["lateralTrackingScale"] * velocity[:, 1].square()
+    speed_scale = config["speedTrackingScale"]
+    lateral_scale = config["lateralTrackingScale"]
+    if "movingSpeedSigmaMin" in config:
+        sigma = (target_speed * config["movingSpeedSigmaFraction"]).clamp(min=config["movingSpeedSigmaMin"])
+        sigma = torch.where(target_speed <= 1e-6, torch.full_like(sigma, config["standingSpeedSigma"]), sigma)
+        speed_scale = sigma.reciprocal().square()
+        lateral_scale = torch.where(target_speed <= 1e-6, speed_scale,
+                                    torch.full_like(target_speed, config["lateralTrackingScale"]))
+    cost = (speed_scale * (velocity[:, 0] - target_speed).square()
+            + lateral_scale * velocity[:, 1].square()
             + config["headingTrackingScale"] * (1 - facing))
     stop = target_speed <= 1e-6
     cost += stop * (config.get("standFootSpeedScale", 0.) * foot_speed_sq
                     + config.get("standLegVelocityScale", 0.) * leg_velocity_sq)
-    return torch.exp(-cost)
+    reward = torch.exp(-cost)
+    if config.get("requireForwardProgress", False):
+        progress = (velocity[:, 0] / target_speed.clamp(min=1e-6)).clamp(0, 1)
+        reward *= torch.where(stop, torch.ones_like(progress), progress)
+    return reward
 
 
 def unit_latent(value):

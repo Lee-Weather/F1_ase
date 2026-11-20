@@ -1,0 +1,24 @@
+extends: humanoid_f1_hlc_0_2.yaml
+env:
+  hlc:
+    speedRange: [0.0, 1.0]
+    stopProbability: 0.2
+    lateralTrackingScale: 16.0
+    movingSpeedSigmaMin: 0.1
+    movingSpeedSigmaFraction: 0.35
+    standingSpeedSigma: 0.05
+    requireForwardProgress: true
+    commandCurriculum:
+      - untilEpoch: 200
+        speedRange: [0.3, 0.8]
+        stopProbability: 0.0
+      - untilEpoch: 500
+        speedRange: [0.1, 1.0]
+        stopProbability: 0.1
+        speedAnchors: [0.1, 0.2, 0.3]
+        anchorProbability: 0.4
+      - untilEpoch: 1000
+        speedRange: [0.0, 1.0]
+        stopProbability: 0.2
+        speedAnchors: [0.1, 0.2, 0.3]
+        anchorProbability: 0.4

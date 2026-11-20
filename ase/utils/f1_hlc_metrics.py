@@ -6,7 +6,8 @@ import torch
 
 class HLCMetrics:
     SPEED_BANDS = (("zero", 0., 0.), ("0_0p5", 0., .5),
-                   ("0p5_1", .5, 1.), ("1_1p5", 1., 1.5), ("1p5_up", 1.5, float("inf")))
+                   ("0p5_1", .5, 1.), ("1_1p5", 1., 1.5), ("1p5_up", 1.5, float("inf")),
+                   ("near_0p1", 1e-6, .15), ("near_0p2", .15, .25), ("near_0p3", .25, .35))
 
     def __init__(self, count, device, dt, config):
         self.count, self.device, self.dt = count, device, dt
