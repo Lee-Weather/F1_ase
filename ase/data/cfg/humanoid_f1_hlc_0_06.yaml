@@ -1,0 +1,18 @@
+extends: humanoid_f1_hlc_0_1.yaml
+env:
+  hlc:
+    speedRange: [0.0, 0.6]
+    commandCurriculum:
+      - untilEpoch: 200
+        speedRange: [0.3, 0.6]
+        stopProbability: 0.0
+      - untilEpoch: 500
+        speedRange: [0.1, 0.6]
+        stopProbability: 0.1
+        speedAnchors: [0.1, 0.2, 0.3]
+        anchorProbability: 0.4
+      - untilEpoch: 1800
+        speedRange: [0.0, 0.6]
+        stopProbability: 0.2
+        speedAnchors: [0.1, 0.2, 0.3]
+        anchorProbability: 0.4
