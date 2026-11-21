@@ -1,0 +1,28 @@
+extends: humanoid_f1_hlc_0_06.yaml
+env:
+  hlc:
+    commandMode: body_velocity
+    velocityTrackingSigma: [0.15, 0.12, 0.25]
+    standingYawSigma: 0.10
+    quietYawRate: 0.10
+    commandCurriculum:
+      # Groups: stop, forward, backward, left, right, turn left, turn right, mixed.
+      # Ranges are positive magnitudes for forward, backward, lateral and yaw.
+      - untilEpoch: 200
+        commandWeights: [0.20, 0.50, 0.30, 0, 0, 0, 0, 0]
+        movingRanges: [[0.10, 0.60], [0.10, 0.20], [0.10, 0.15], [0.15, 0.30]]
+        maxPlanarSpeed: 0.60
+        lowSpeedAnchors: [0.10, 0.15, 0.20]
+        anchorProbability: 0.4
+      - untilEpoch: 600
+        commandWeights: [0.20, 0.25, 0.15, 0.10, 0.10, 0.10, 0.10, 0]
+        movingRanges: [[0.10, 0.60], [0.10, 0.25], [0.10, 0.20], [0.15, 0.35]]
+        maxPlanarSpeed: 0.60
+        lowSpeedAnchors: [0.10, 0.15, 0.20]
+        anchorProbability: 0.4
+      - untilEpoch: 1800
+        commandWeights: [0.20, 0.20, 0.15, 0.10, 0.10, 0.05, 0.05, 0.15]
+        movingRanges: [[0.05, 0.60], [0.05, 0.30], [0.05, 0.25], [0.10, 0.50]]
+        maxPlanarSpeed: 0.60
+        lowSpeedAnchors: [0.10, 0.15, 0.20]
+        anchorProbability: 0.4

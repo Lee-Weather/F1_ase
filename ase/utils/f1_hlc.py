@@ -134,10 +134,7 @@ def control_interval(task, llc, z, llc_steps, step=None, on_step=None):
             step(action)
         valid = active.clone()
         if hasattr(task, "hlc_metrics"):
-            foot_sq, leg_sq = task._standing_motion()
-            task.hlc_metrics.step(task.target_speed, task._humanoid_root_states[:, 7],
-                                  task._humanoid_root_states[:, 8], foot_sq.sqrt(), leg_sq.sqrt(),
-                                  valid, task.extras["terminate"].bool(), task.reset_buf.bool())
+            task.observe_hlc_step(valid)
         reward += task.rew_buf * valid
         disc += llc.disc_reward(task.extras["amp_obs"]).squeeze(-1) * valid
         samples += valid
@@ -157,6 +154,10 @@ def control_interval(task, llc, z, llc_steps, step=None, on_step=None):
             on_step(task, z, action)
         if not active.any():
             break
+    if getattr(task, "velocity_commands", False):
+        updated = task.advance_velocity_commands(active)
+        result_obs[updated] = task.obs_buf[updated]
+        result_states[updated] = task.states_buf[updated]
     info = dict(terminate=terminated.long(), termination_reasons=reasons, motion_metrics=metrics,
                 disc_rewards=(disc/samples.clamp(min=1)).unsqueeze(-1), task_rewards=reward/samples.clamp(min=1),
                 llc_substeps=terminal_steps)

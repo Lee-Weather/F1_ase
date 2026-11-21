@@ -8,11 +8,14 @@ from env.tasks.humanoid_f1 import HumanoidF1
 from utils.f1_hlc import speed_task_reward
 from utils.f1_hlc_metrics import HLCMetrics
 from utils.f1_hlc_curriculum import command_stage
+from utils.f1_hlc_velocity import (VelocityMetrics, heading_velocity, sample_velocity_commands,
+                                   velocity_task_reward)
 
 
 class HumanoidF1HLC(HumanoidF1):
     def __init__(self, cfg, *args, **kwargs):
         self.hlc = cfg["env"]["hlc"]
+        self.velocity_commands = self.hlc.get("commandMode") == "body_velocity"
         self.training_epoch = 0
         if not 0 <= self.hlc.get("stopProbability", 0.) <= 1:
             raise ValueError("stopProbability must be in [0, 1]")
@@ -21,11 +24,16 @@ class HumanoidF1HLC(HumanoidF1):
                               ("left_ankle_roll_link", "right_ankle_roll_link")]
         self._hlc_leg_ids = [i for i, n in enumerate(self._dof_names)
                              if any(part in n for part in ("hip", "knee", "ankle"))]
-        self.target_speed = torch.ones(self.num_envs, device=self.device)
         self.command_next_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.target_direction = torch.zeros((self.num_envs, 3), device=self.device)
-        self.target_direction[:, 0] = 1  # Fixed world heading, not a rotating body-forward goal.
-        self.hlc_metrics = HLCMetrics(self.num_envs, self.device, self.dt, self.hlc)
+        if self.velocity_commands:
+            self.target_velocity = torch.zeros((self.num_envs, 3), device=self.device)
+            self.command_groups = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+            self.hlc_metrics = VelocityMetrics(self.device)
+        else:
+            self.target_speed = torch.ones(self.num_envs, device=self.device)
+            self.target_direction = torch.zeros((self.num_envs, 3), device=self.device)
+            self.target_direction[:, 0] = 1
+            self.hlc_metrics = HLCMetrics(self.num_envs, self.device, self.dt, self.hlc)
 
     def _setup_character_props(self, key_bodies):
         super()._setup_character_props(key_bodies)
@@ -37,6 +45,18 @@ class HumanoidF1HLC(HumanoidF1):
 
     def _sample_commands(self, ids, reset=False):
         _, stage = command_stage(self.hlc, self.training_epoch)
+        if self.velocity_commands:
+            commands, groups = sample_velocity_commands(stage, len(ids), self.device)
+            self.target_velocity[ids] = commands
+            self.command_groups[ids] = groups
+        else:
+            self._sample_speed_commands(ids, stage)
+        steps = self.hlc["llcSteps"]
+        lo, hi = [max(1, math.ceil(s/self.dt/steps)) for s in self.hlc["commandHoldSeconds"]]
+        hold = torch.randint(lo, hi+1, (len(ids),), device=self.device)*steps
+        self.command_next_step[ids] = hold if reset else self.progress_buf[ids]+hold
+
+    def _sample_speed_commands(self, ids, stage):
         low, high = stage["speedRange"]
         self.target_speed[ids] = low + (high-low)*torch.rand(len(ids), device=self.device)
         anchors = stage.get("speedAnchors", [])
@@ -49,10 +69,6 @@ class HumanoidF1HLC(HumanoidF1):
         if stop_probability:
             stop = torch.rand(len(ids), device=self.device) < stop_probability
             self.target_speed[ids[stop]] = 0
-        steps = self.hlc["llcSteps"]
-        lo, hi = [max(1, math.ceil(s/self.dt/steps)) for s in self.hlc["commandHoldSeconds"]]
-        hold = torch.randint(lo, hi+1, (len(ids),), device=self.device)*steps
-        self.command_next_step[ids] = hold if reset else self.progress_buf[ids]+hold
 
     def set_training_epoch(self, epoch):
         # Preserve an already-issued command until its normal expiry. This also
@@ -61,28 +77,45 @@ class HumanoidF1HLC(HumanoidF1):
 
     def _reset_envs(self, env_ids):
         if len(env_ids):
-            if hasattr(self, "hlc_metrics"):
+            if not self.velocity_commands and hasattr(self, "hlc_metrics"):
                 self.hlc_metrics.reset(env_ids)
             self._sample_commands(env_ids, reset=True)
         super()._reset_envs(env_ids)
 
     def pre_physics_step(self, actions):
-        ids = (self.progress_buf >= self.command_next_step).nonzero(as_tuple=False).flatten()
+        if not self.velocity_commands:
+            ids = (self.progress_buf >= self.command_next_step).nonzero(as_tuple=False).flatten()
+            if len(ids):
+                self._sample_commands(ids)
+        super().pre_physics_step(actions)
+
+    def advance_velocity_commands(self, active):
+        """Issue the next command after the last transition of the old command."""
+        ids = (active & (self.progress_buf >= self.command_next_step)).nonzero(as_tuple=False).flatten()
         if len(ids):
             self._sample_commands(ids)
-        super().pre_physics_step(actions)
+            self._compute_observations(ids)
+        return ids
 
     def _compute_observations(self, env_ids=None):
         super()._compute_observations(env_ids)
         ids = slice(None) if env_ids is None else env_ids
         # Root orientation is available to an IMU-based actor. True linear
         # velocity remains confined to the critic and reward computation.
-        direction = quat_rotate_inverse(self._humanoid_root_states[ids, 3:7], self.target_direction[ids])
-        command = torch.cat((direction[:, :2], self.target_speed[ids, None]), -1)
+        if self.velocity_commands:
+            command = self.target_velocity[ids]
+        else:
+            direction = quat_rotate_inverse(self._humanoid_root_states[ids, 3:7], self.target_direction[ids])
+            command = torch.cat((direction[:, :2], self.target_speed[ids, None]), -1)
         self.obs_buf[ids, 93:] = command
         self.states_buf[ids, 448:] = command
 
     def _compute_reward(self, actions):
+        if self.velocity_commands:
+            foot_sq, leg_sq = self._standing_motion()
+            self.rew_buf[:] = velocity_task_reward(
+                self._heading_velocity(), self.target_velocity, foot_sq, leg_sq, self.hlc)
+            return
         velocity = self._humanoid_root_states[:, 7:10]
         forward = torch.zeros_like(velocity)
         forward[:, 0] = 1
@@ -91,12 +124,24 @@ class HumanoidF1HLC(HumanoidF1):
         self.rew_buf[:] = speed_task_reward(velocity, facing, self.target_speed,
                                             foot_speed_sq, leg_velocity_sq, self.hlc)
 
+    def _heading_velocity(self):
+        root = self._humanoid_root_states
+        x, y, z, w = root[:, 3:7].unbind(dim=-1)
+        fx, fy = 1 - 2 * (y.square() + z.square()), 2 * (x*y + z*w)
+        return torch.stack(heading_velocity(fx, fy, root[:, 7], root[:, 8], root[:, 12]), dim=-1)
+
     def _standing_motion(self):
         return (self._rigid_body_vel[:, self._hlc_foot_ids].square().sum(-1).mean(-1),
                 self._dof_vel[:, self._hlc_leg_ids].square().mean(-1))
 
     def _compute_reset(self):
         super()._compute_reset()
+        if self.velocity_commands:
+            stage, _ = command_stage(self.hlc, self.training_epoch)
+            self.extras["motion_metrics"].update(
+                task_reward=self.rew_buf.clone(),
+                curriculum_stage=torch.full_like(self.rew_buf, stage))
+            return
         foot_speed_sq, leg_velocity_sq = self._standing_motion()
         zero = self.target_speed <= 1e-6
         quiet = (self._humanoid_root_states[:, 7:9].norm(dim=-1) < self.hlc.get("quietPlanarSpeed", .05))
@@ -117,6 +162,21 @@ class HumanoidF1HLC(HumanoidF1):
         if self.hlc.get("commandCurriculum"):
             stage, _ = command_stage(self.hlc, self.training_epoch)
             self.extras["motion_metrics"]["curriculum_stage"] = torch.full_like(self.target_speed, stage)
+
+    def observe_hlc_step(self, valid):
+        foot_sq, leg_sq = self._standing_motion()
+        failed = self.extras["terminate"].bool()
+        if self.velocity_commands:
+            actual = self._heading_velocity()
+            quiet = (actual[:, :2].norm(dim=-1) < self.hlc["quietPlanarSpeed"])
+            quiet &= actual[:, 2].abs() < self.hlc["quietYawRate"]
+            quiet &= foot_sq.sqrt() < self.hlc["quietFootSpeed"]
+            quiet &= leg_sq.sqrt() < self.hlc["quietLegVelocity"]
+            self.hlc_metrics.step(self.command_groups, actual, self.target_velocity, valid, quiet & ~failed, failed)
+        else:
+            self.hlc_metrics.step(self.target_speed, self._humanoid_root_states[:, 7],
+                                  self._humanoid_root_states[:, 8], foot_sq.sqrt(), leg_sq.sqrt(),
+                                  valid, failed, self.reset_buf.bool())
 
     def get_training_metadata(self):
         result = super().get_training_metadata()

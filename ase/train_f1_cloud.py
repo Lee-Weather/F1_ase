@@ -216,13 +216,16 @@ def cloud_observer_class(entry, args):
             result["motion"] = self._last_motion_metrics
             self._last_hlc_metrics = {}
             if hasattr(self, "_hlc_totals"):
-                from utils.f1_hlc_metrics import summarize_hlc_metrics
-                self._last_hlc_metrics = summarize_hlc_metrics(
-                    {name: float(value) for name, value in self._hlc_totals.items()})
-                self._hlc_totals = {}
                 task = self.algo.vec_env.env.task
-                for name, count in task.hlc_metrics.pending().items():
-                    self._last_hlc_metrics["HLC_Events/" + name + "_pending"] = count
+                if task.velocity_commands:
+                    self._last_hlc_metrics = task.hlc_metrics.summarize(self._hlc_totals)
+                else:
+                    from utils.f1_hlc_metrics import summarize_hlc_metrics
+                    self._last_hlc_metrics = summarize_hlc_metrics(
+                        {name: float(value) for name, value in self._hlc_totals.items()})
+                    for name, count in task.hlc_metrics.pending().items():
+                        self._last_hlc_metrics["HLC_Events/" + name + "_pending"] = count
+                self._hlc_totals = {}
                 for name, value in self._last_hlc_metrics.items():
                     self.writer.add_scalar(name, value, frame)
                 result["hlc"] = self._last_hlc_metrics
