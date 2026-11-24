@@ -10,7 +10,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.f1_hlc_curriculum import command_stage
 from utils.f1_hlc_velocity import (VelocityMetrics, heading_velocity, sample_velocity_commands,
-                                   velocity_task_reward)
+                                   standing_joint_groups, standing_pose_mse, velocity_task_reward)
 
 
 class VelocityTests(unittest.TestCase):
@@ -85,3 +85,45 @@ class VelocityTests(unittest.TestCase):
         self.assertEqual(result["HLC_Velocity/backward/falls"], 1)
         self.assertEqual(result["HLC_Velocity/stop/quiet_fraction"], 1.)
         self.assertEqual(metrics.summarize(metrics.drain()), {})
+
+    def test_standing_pose_rewards_exact_stop_and_respects_braking(self):
+        config = dict(self.cfg, standingPoseWeight=.4, standingPoseSigmaRad=[.12,.18,.25],
+                      standingPoseGroupWeights=[.30,.45,.25])
+        command = np.array([[0,0,0], [0,0,.2], [.35,0,0], [0,0,1e-7]], dtype=np.float32)
+        actual = command.copy()
+        stationary = np.zeros(len(command), dtype=np.float32)
+        groups = standing_joint_groups(["lumbar_pitch_joint", "left_knee_pitch_joint", "left_elbow_pitch_joint"])
+        reference = np.zeros(3, dtype=np.float32)
+        crouched = np.tile(np.array([.2,.4,.6], dtype=np.float32), (len(command), 1))
+        errors = standing_pose_mse(crouched, reference, groups)
+        legacy = velocity_task_reward(actual, command, stationary, stationary, self.cfg)
+        shaped = velocity_task_reward(actual, command, stationary, stationary, config, errors)
+        self.assertLess(shaped[0], legacy[0])
+        np.testing.assert_array_equal(shaped[1:], legacy[1:])
+        good = velocity_task_reward(actual, command, stationary, stationary, config,
+                                    standing_pose_mse(np.zeros_like(crouched), reference, groups))
+        np.testing.assert_array_equal(good, legacy)
+        actual[0, 0] = .1
+        moving = velocity_task_reward(actual, command, stationary, stationary, config, errors)
+        self.assertLess(moving[0], shaped[0])
+        self.assertLess(1 - moving[0] / velocity_task_reward(actual, command, stationary, stationary, self.cfg)[0],
+                        1 - shaped[0] / legacy[0])
+        torch_reward = velocity_task_reward(torch.from_numpy(actual), torch.from_numpy(command),
+                                           torch.from_numpy(stationary), torch.from_numpy(stationary), config,
+                                           tuple(torch.from_numpy(value) for value in errors))
+        np.testing.assert_allclose(torch_reward.numpy(), moving, atol=1e-6)
+
+    def test_pose_metrics_use_only_valid_quiet_zero_commands(self):
+        metrics = VelocityMetrics("cpu", standing_pose=True)
+        groups = torch.tensor([0, 0, 0, 0, 5])
+        actual = torch.zeros((5, 3))
+        command = actual.clone()
+        command[-1, 2] = .2
+        valid = torch.tensor([True, True, True, False, True])
+        quiet = torch.tensor([True, False, True, True, True])
+        failed = torch.tensor([False, False, True, False, False])
+        pose = torch.tensor([.01, 1., 1., 1., 1.])
+        metrics.step(groups, actual, command, valid, quiet, failed, (pose, pose * 4, pose * 9))
+        summary = metrics.summarize(metrics.drain())
+        self.assertEqual(summary["HLC_Velocity/stop/pose_samples"], 1.)
+        self.assertAlmostEqual(summary["HLC_Velocity/stop/pose_legs_rms_deg"], 11.459156, places=5)

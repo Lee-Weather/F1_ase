@@ -1,0 +1,17 @@
+extends: humanoid_f1_hlc_forward_yaw.yaml
+env:
+  hlc:
+    standingPoseWeight: 0.40
+    # Waist, legs and arms, in this order.
+    standingPoseSigmaRad: [0.12, 0.18, 0.25]
+    standingPoseGroupWeights: [0.30, 0.45, 0.25]
+    commandCurriculum:
+      - untilEpoch: 2100
+        commandWeights: [0.30, 0.35, 0, 0, 0, 0.10, 0.10, 0.15]
+        movingRanges: [[0.0, 0.50], [0, 0], [0, 0], [0.0, 0.20]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.20, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+        mixedAxes: [[1, 0, 1]]
+        mixedBackwardProbability: 0.0

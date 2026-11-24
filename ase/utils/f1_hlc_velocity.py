@@ -1,7 +1,21 @@
 """Three-axis F1 commands in the horizontal frame of the robot's heading."""
 
+import math
+
 
 COMMAND_GROUPS = ("stop", "forward", "backward", "left", "right", "turn_left", "turn_right", "mixed")
+STANDING_GROUPS = {"waist": ("lumbar",), "legs": ("hip", "knee", "ankle"),
+                   "arms": ("shoulder", "elbow", "wrist")}
+
+
+def standing_joint_groups(names):
+    return tuple([i for i, name in enumerate(names) if any(part in name for part in parts)]
+                 for parts in STANDING_GROUPS.values())
+
+
+def standing_pose_mse(position, reference, groups):
+    error_sq = (position - reference) ** 2
+    return tuple(error_sq[..., ids].mean(-1) for ids in groups)
 
 
 def sample_velocity_commands(stage, count, device):
@@ -43,7 +57,7 @@ def heading_velocity(fx, fy, vx, vy, wz):
     return ((fx * vx + fy * vy) / length, (fx * vy - fy * vx) / length, wz)
 
 
-def velocity_task_reward(actual, command, foot_speed_sq, leg_velocity_sq, config):
+def velocity_task_reward(actual, command, foot_speed_sq, leg_velocity_sq, config, pose_mse=None):
     """Works with Torch batches and NumPy replay arrays using identical math."""
     vx, vy, yaw = actual[..., 0], actual[..., 1], actual[..., 2]
     tx, ty, tz = command[..., 0], command[..., 1], command[..., 2]
@@ -65,22 +79,36 @@ def velocity_task_reward(actual, command, foot_speed_sq, leg_velocity_sq, config
     yaw_progress = (yaw * tz / (tz * tz).clip(1e-12, None)).clip(0., 1.)
     axes = translating * 1. + turning * 1.
     progress = (planar_progress + yaw_progress + stop) / axes.clip(1., None)
-    return (.2 + .8 * progress) / (1. + cost)
+    reward = (.2 + .8 * progress) / (1. + cost)
+    weight = config.get("standingPoseWeight", 0.)
+    if weight:
+        sigma = config["standingPoseSigmaRad"]
+        group_weights = config["standingPoseGroupWeights"]
+        pose_cost = sum(w * error / s**2 for w, s, error in zip(group_weights, sigma, pose_mse))
+        exact_stop = (command == 0).all(-1)
+        # Keep the original braking signal dominant while the robot is moving.
+        blend = weight * exact_stop / (1. + cost)
+        reward *= 1. - blend * (1. - 1. / (1. + pose_cost))
+    return reward
 
 
 class VelocityMetrics:
-    def __init__(self, device):
+    def __init__(self, device, standing_pose=False):
         import torch
 
-        self.totals = torch.zeros((len(COMMAND_GROUPS), 10), device=device)
+        self.totals = torch.zeros((len(COMMAND_GROUPS), 14 if standing_pose else 10), device=device)
 
-    def step(self, groups, actual, command, valid, quiet, failed):
+    def step(self, groups, actual, command, valid, quiet, failed, pose_mse=None):
         import torch
 
         direction = (((command == 0) | (actual * command > 0)).all(-1)
                      & (command != 0).any(-1))
         samples = torch.cat((valid[:, None], actual, (actual - command).abs(),
                              quiet[:, None], failed[:, None], direction[:, None]), dim=-1)
+        if pose_mse is not None:
+            standing = quiet & ~failed & (command == 0).all(-1)
+            pose = torch.stack(pose_mse, dim=-1).sqrt() * standing[:, None]
+            samples = torch.cat((samples, standing[:, None], pose), dim=-1)
         self.totals.index_add_(0, groups, samples * valid[:, None])
 
     def drain(self):
@@ -93,7 +121,7 @@ class VelocityMetrics:
         result = {}
         all_samples = sum(float(values[0]) for values in totals.values())
         for group, values in totals.items():
-            count, vx, vy, wz, ex, ey, ez, quiet, falls, direction = values.tolist()
+            count, vx, vy, wz, ex, ey, ez, quiet, falls, direction = values[:10].tolist()
             if not count:
                 continue
             prefix = "HLC_Velocity/" + group + "/"
@@ -104,6 +132,12 @@ class VelocityMetrics:
             result[prefix + "falls"] = int(falls)
             if group == "stop":
                 result[prefix + "quiet_fraction"] = quiet / count
+                if len(values) > 10:
+                    pose_count, *pose_totals = values[10:].tolist()
+                    result[prefix + "pose_samples"] = pose_count
+                    if pose_count:
+                        for name, error in zip(STANDING_GROUPS, pose_totals):
+                            result[prefix + "pose_" + name + "_rms_deg"] = math.degrees(error / pose_count)
             else:
                 result[prefix + "direction_fraction"] = direction / count
         return result

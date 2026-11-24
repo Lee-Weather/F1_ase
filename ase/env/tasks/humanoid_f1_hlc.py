@@ -11,7 +11,7 @@ from utils.f1_hlc_gait import AlternatingGait, load_foot_vertices
 from utils.f1_hlc_metrics import HLCMetrics
 from utils.f1_hlc_curriculum import command_stage
 from utils.f1_hlc_velocity import (VelocityMetrics, heading_velocity, sample_velocity_commands,
-                                   velocity_task_reward)
+                                   standing_joint_groups, standing_pose_mse, velocity_task_reward)
 
 
 class HumanoidF1HLC(HumanoidF1):
@@ -43,7 +43,10 @@ class HumanoidF1HLC(HumanoidF1):
         if self.velocity_commands:
             self.target_velocity = torch.zeros((self.num_envs, 3), device=self.device)
             self.command_groups = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-            self.hlc_metrics = VelocityMetrics(self.device)
+            standing_pose = self.hlc.get("standingPoseWeight", 0.) > 0
+            self._standing_groups = standing_joint_groups(self._dof_names) if standing_pose else None
+            self._standing_pose_mse = None
+            self.hlc_metrics = VelocityMetrics(self.device, standing_pose)
         else:
             self.target_speed = torch.ones(self.num_envs, device=self.device)
             self.target_direction = torch.zeros((self.num_envs, 3), device=self.device)
@@ -141,8 +144,11 @@ class HumanoidF1HLC(HumanoidF1):
     def _compute_reward(self, actions):
         if self.velocity_commands:
             foot_sq, leg_sq = self._standing_motion()
+            if self._standing_groups is not None:
+                self._standing_pose_mse = standing_pose_mse(
+                    self._dof_pos, self._default_joint_pos, self._standing_groups)
             self.rew_buf[:] = velocity_task_reward(
-                self._heading_velocity(), self.target_velocity, foot_sq, leg_sq, self.hlc)
+                self._heading_velocity(), self.target_velocity, foot_sq, leg_sq, self.hlc, self._standing_pose_mse)
             return
         velocity = self._humanoid_root_states[:, 7:10]
         forward = torch.zeros_like(velocity)
@@ -200,7 +206,8 @@ class HumanoidF1HLC(HumanoidF1):
             quiet &= actual[:, 2].abs() < self.hlc["quietYawRate"]
             quiet &= foot_sq.sqrt() < self.hlc["quietFootSpeed"]
             quiet &= leg_sq.sqrt() < self.hlc["quietLegVelocity"]
-            self.hlc_metrics.step(self.command_groups, actual, self.target_velocity, valid, quiet & ~failed, failed)
+            self.hlc_metrics.step(self.command_groups, actual, self.target_velocity, valid, quiet & ~failed,
+                                  failed, self._standing_pose_mse)
         else:
             self.hlc_metrics.step(self.target_speed, self._humanoid_root_states[:, 7],
                                   self._humanoid_root_states[:, 8], foot_sq.sqrt(), leg_sq.sqrt(),

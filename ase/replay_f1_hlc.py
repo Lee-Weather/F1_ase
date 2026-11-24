@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 import numpy as np
-from utils.f1_hlc_velocity import heading_velocity, velocity_task_reward
+from utils.f1_hlc_velocity import heading_velocity, standing_joint_groups, standing_pose_mse, velocity_task_reward
 
 
 PROTOCOL_SPEEDS = {
@@ -209,6 +209,8 @@ def replay_mujoco(args, speeds):
     engine = MujocoReplay(cfg, names, record_video=not args.no_video)
     feet = [engine.model.body(n).id for n in ("left_ankle_roll_link", "right_ankle_roll_link")]
     leg_ids = [i for i, n in enumerate(names) if any(part in n for part in ("hip", "knee", "ankle"))]
+    stand_groups = standing_joint_groups(names) if hlc.get("standingPoseWeight", 0.) else None
+    stand_pose = np.array([cfg["env"]["defaultJointPos"][name] for name in names]) if stand_groups else None
     video = None
     physical_step, hlc_step = 0, 0
     errors, reasons = [], []
@@ -255,7 +257,8 @@ def replay_mujoco(args, speeds):
                     if velocity_mode:
                         actual = np.asarray(heading_velocity(forward[0], forward[1], vx, vy, velocity[2]))
                         fields = [index+1, *target, *actual, math.atan2(forward[1], forward[0])]
-                        reward = float(velocity_task_reward(actual, command, foot_speed_sq, leg_velocity_sq, hlc))
+                        pose_mse = standing_pose_mse(q, stand_pose, stand_groups) if stand_groups else None
+                        reward = float(velocity_task_reward(actual, command, foot_speed_sq, leg_velocity_sq, hlc, pose_mse))
                         errors.append(np.abs(actual - command))
                     elif args.policy_npz:
                         reward = numpy_task_reward(velocity[3:], forward[0], target, foot_speed_sq, leg_velocity_sq, hlc)
