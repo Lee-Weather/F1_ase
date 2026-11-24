@@ -5,6 +5,8 @@ import torch
 
 
 class HLCMetrics:
+    SWING_PROGRESS = tuple(f"{side}_{phase}_progress" for side in ("left", "right")
+                           for phase in ("unload", "lift", "advance"))
     SPEED_BANDS = (("zero", 0., 0.), ("0_0p5", 0., .5),
                    ("0p5_1", .5, 1.), ("1_1p5", 1., 1.5), ("1p5_up", 1.5, float("inf")),
                    ("near_0p1", 1e-6, .15), ("near_0p2", .15, .25), ("near_0p3", .25, .35))
@@ -40,12 +42,14 @@ class HLCMetrics:
             keys += ["gait/" + name for name in ("moving_samples", "left_footfalls", "right_footfalls",
                                                  "alternating_footfalls", "recent_alternation_samples",
                                                  "stance_samples", "stance_slip_sum_m_s")]
+            if config["gaitReward"].get("swingProgressWeight", 0.) > 0:
+                keys += ["gait/" + name for name in self.SWING_PROGRESS]
         self.totals = {key: torch.zeros((), device=device) for key in keys}
 
     def _add(self, key, values):
         self.totals[key] += values.float().sum()
 
-    def record_gait(self, live, recent, alternating, complete, slip, stance):
+    def record_gait(self, live, recent, alternating, complete, slip, stance, swing_increment=None):
         self._add("gait/moving_samples", live)
         self._add("gait/left_footfalls", complete[:, 0])
         self._add("gait/right_footfalls", complete[:, 1])
@@ -53,6 +57,10 @@ class HLCMetrics:
         self._add("gait/recent_alternation_samples", recent > 0)
         self._add("gait/stance_samples", stance)
         self._add("gait/stance_slip_sum_m_s", slip)
+        if swing_increment is not None:
+            sums = swing_increment.sum(dim=0).flatten()
+            for name, value in zip(self.SWING_PROGRESS, sums):
+                self.totals["gait/" + name] += value
 
     def _clear(self, ids):
         self.mode[ids] = 0
@@ -182,4 +190,7 @@ def summarize_hlc_metrics(totals):
                 totals["gait/recent_alternation_samples"] / totals["gait/moving_samples"])
         if totals["gait/stance_samples"]:
             result["HLC_Gait/stance_slip_mean_m_s"] = totals["gait/stance_slip_sum_m_s"] / totals["gait/stance_samples"]
+        for name in HLCMetrics.SWING_PROGRESS:
+            if "gait/" + name in totals:
+                result["HLC_Gait/" + name] = totals["gait/" + name]
     return result

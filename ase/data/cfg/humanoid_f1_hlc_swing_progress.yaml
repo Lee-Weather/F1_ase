@@ -1,0 +1,15 @@
+extends: humanoid_f1_hlc_alternating_gait.yaml
+env:
+  hlc:
+    speedRange: [0.30, 0.50]
+    stopProbability: 0.0
+    commandCurriculum:
+      - untilEpoch: 100
+        speedRange: [0.30, 0.50]
+        stopProbability: 0.0
+    gaitReward:
+      speedRewardFloor: 1.0
+      swingProgressWeight: 0.15
+      swingSupportLoadN: 75.0
+      alternatingStepBonus: 0.05
+      stanceSlipWeight: 0.0

@@ -57,6 +57,11 @@ class AlternatingGait:
         self.peak_clearance = torch.zeros_like(self.previous_x)
         self.last_side = torch.full((count,), -1, dtype=torch.long, device=device)
         self.alternation_age = torch.full_like(self.last_side, self.memory_steps)
+        self.swing_increment = None
+        if config.get("swingProgressWeight", 0.) > 0:
+            self.swing_best = self.vertices.new_zeros((count, 2, 3))
+            self.swing_increment = torch.zeros_like(self.swing_best)
+            self.swing_component_weights = self.vertices.new_tensor([.25, .30, .45])
 
     def reset(self, ids):
         self.previous_live[ids] = False
@@ -65,6 +70,9 @@ class AlternatingGait:
         self.peak_clearance[ids] = 0
         self.last_side[ids] = -1
         self.alternation_age[ids] = self.memory_steps
+        if self.swing_increment is not None:
+            self.swing_best[ids] = 0
+            self.swing_increment[ids] = 0
 
     def step(self, position, rotation, force_z, live):
         cfg = self.config
@@ -86,6 +94,10 @@ class AlternatingGait:
         single = complete.sum(dim=-1) == 1
         side = complete[:, 1].long()
         alternating = single & (self.last_side >= 0) & (side != self.last_side)
+        if self.swing_increment is not None:
+            accepted = single & ((self.last_side < 0) | alternating)
+            self._swing_progress(force_z, clearance, position[..., 0] - self.takeoff_x,
+                                 airborne, continuing, accepted)
         self.last_side = torch.where(live, torch.where(single, side, self.last_side), -1)
         # A repeated footfall clears the speed multiplier. The next accepted
         # landing of the other foot can begin a new alternation.
@@ -100,6 +112,26 @@ class AlternatingGait:
         self.previous_support.copy_(supported)
         self.previous_live.copy_(live)
         return recent, alternating, complete, slip, stance
+
+    def _swing_progress(self, force_z, clearance, advance, airborne, continuing, accepted):
+        cfg = self.config
+        load = force_z.clamp(min=0)
+        opposite = load.flip(dims=(1,))
+        unload = ((opposite - load) / (opposite + load).clamp(min=1)).clamp(0, 1)
+        # Weight transfer must be onto a support foot. Height and advance only
+        # count once a takeoff from the ground has been observed.
+        min_load = cfg["minContactForceN"]
+        unload *= ((opposite - min_load) / (cfg["swingSupportLoadN"] - min_load)).clamp(0, 1)
+        lift = (clearance / cfg["minClearanceM"]).clamp(0, 1) * airborne
+        forward = (advance / cfg["minAdvanceM"]).clamp(0, 1)
+        progress = torch.stack((unload, unload * lift, unload * lift * forward), dim=-1)
+        expected = torch.stack((self.last_side != 0, self.last_side != 1), dim=-1) & continuing
+        progress *= expected[..., None]
+        self.swing_increment = (progress - self.swing_best).clamp(min=0)
+        # Keep the best score until the next accepted step, including when an
+        # attempted swing lands short. Rocking or hovering cannot earn it again.
+        keep = continuing & ~accepted[:, None]
+        self.swing_best = torch.maximum(self.swing_best, progress) * keep[..., None]
 
     def _stance_slip(self, points, clearance, supported, continuing):
         depth = self.config["stanceVertexHeightM"]
@@ -118,5 +150,9 @@ class AlternatingGait:
         slip_cost = (slip / cfg["slipSpeedScaleMps"]).square().clamp(max=1)
         slip_cost = slip_cost.sum(dim=-1) / stance.sum(dim=-1).clamp(min=1)
         floor = cfg["speedRewardFloor"]
-        return (speed_reward * (floor + (1 - floor) * recent)
-                + cfg["alternatingStepBonus"] * alternating.float() - cfg["stanceSlipWeight"] * slip_cost)
+        reward = (speed_reward * (floor + (1 - floor) * recent)
+                  + cfg["alternatingStepBonus"] * alternating.float() - cfg["stanceSlipWeight"] * slip_cost)
+        if self.swing_increment is not None:
+            progress = (self.swing_increment * self.swing_component_weights).sum(dim=(1, 2))
+            reward += cfg["swingProgressWeight"] * progress
+        return reward

@@ -23,7 +23,7 @@ class HumanoidF1HLC(HumanoidF1):
             raise ValueError("gaitReward requires scalar forward commands")
         sequence_enabled = any(stage.get("restartSequenceProbability", 0.)
                                for stage in self.hlc.get("commandCurriculum", []))
-        self.commands_at_interval_boundary = self.velocity_commands or sequence_enabled
+        self.commands_at_interval_boundary = self.velocity_commands or sequence_enabled or gait_cfg is not None
         self.training_epoch = 0
         if not 0 <= self.hlc.get("stopProbability", 0.) <= 1:
             raise ValueError("stopProbability must be in [0, 1]")
@@ -217,7 +217,7 @@ class HumanoidF1HLC(HumanoidF1):
         shaped = self.gait.moving_reward(self.rew_buf, recent, alternating, slip, stance)
         self.rew_buf[:] = torch.where(valid & moving, shaped, self.rew_buf)
         self.extras["motion_metrics"]["task_reward"] = self.rew_buf.clone()
-        self.hlc_metrics.record_gait(live, recent, alternating, complete, slip, stance)
+        self.hlc_metrics.record_gait(live, recent, alternating, complete, slip, stance, self.gait.swing_increment)
 
     def get_training_metadata(self):
         result = super().get_training_metadata()

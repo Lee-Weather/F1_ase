@@ -94,6 +94,54 @@ class GaitTests(unittest.TestCase):
         self.assertEqual(summary["HLC_Gait/stance_samples"], 2)
         self.assertAlmostEqual(summary["HLC_Gait/stance_slip_mean_m_s"], .1, places=5)
 
+    def enable_swing_progress(self):
+        path = Path(__file__).resolve().parents[1] / "data/cfg/humanoid_f1_hlc_swing_progress.yaml"
+        self.config["gaitReward"].update(yaml.safe_load(path.read_text())["env"]["hlc"]["gaitReward"])
+        self.gait = AlternatingGait(1, "cpu", self.dt, self.config["gaitReward"], torch.zeros(2, 1, 3))
+        self.observe()
+
+    def test_from_scratch_config_keeps_full_speed_reward(self):
+        self.enable_swing_progress()
+        recent, event, _, _, _ = self.observe()
+        speed = torch.tensor([.8])
+        shaped = self.gait.moving_reward(speed, recent, event, torch.ones(1, 2), torch.ones(1, 2, dtype=torch.bool))
+        torch.testing.assert_close(shaped, speed)
+
+    def test_swing_progress_starts_at_weight_transfer_and_is_bounded(self):
+        self.enable_swing_progress()
+        self.load[0] = torch.tensor([35., 105.])
+        self.observe()
+        self.assertGreater(self.gait.swing_increment[0, 0, 0].item(), 0)
+        self.assertEqual(self.gait.swing_increment[0, 0, 1:].sum().item(), 0)
+        self.load[0] = torch.tensor([0., 105.])
+        self.position[0, 0] = torch.tensor([.035, 0., .02])
+        recent, event, complete, slip, stance = self.observe()
+        self.assertTrue((self.gait.swing_increment[0, 0, 1:] > 0).all().item())
+        self.assertFalse(complete.any().item())
+        metrics = HLCMetrics(1, "cpu", self.dt, self.config)
+        metrics.record_gait(torch.tensor([True]), recent, event, complete, slip, stance, self.gait.swing_increment)
+        summary = summarize_hlc_metrics({key: value.item() for key, value in metrics.drain().items()})
+        self.assertEqual(summary["HLC_Gait/left_advance_progress"], 1)
+        self.assertEqual(summary["HLC_Gait/right_advance_progress"], 0)
+        self.observe()
+        self.assertEqual(self.gait.swing_increment.sum().item(), 0)
+        self.load.fill_(0.)
+        self.observe()
+        self.assertEqual(self.gait.swing_increment.sum().item(), 0)
+
+    def test_swing_progress_rewards_the_other_side_after_a_landing(self):
+        self.enable_swing_progress()
+        self.assertTrue(self.swing(0)[2][0, 0].item())
+        self.load[0] = torch.tensor([0., 100.])
+        self.observe()
+        self.assertEqual(self.gait.swing_increment.sum().item(), 0)
+        self.load[0] = torch.tensor([100., 40.])
+        self.observe()
+        self.assertGreater(self.gait.swing_increment[0, 1, 0].item(), 0)
+        self.observe(moving=False)
+        self.assertEqual(self.gait.swing_increment.sum().item(), 0)
+        self.assertEqual(self.gait.swing_best.sum().item(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
