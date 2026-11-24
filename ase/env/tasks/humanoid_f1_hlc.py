@@ -1,11 +1,13 @@
 """F1 HLC speed task; underlying 29-action LLC physics remains unchanged."""
 import math
+from pathlib import Path
 
 import torch
 from isaacgym.torch_utils import quat_rotate, quat_rotate_inverse
 
 from env.tasks.humanoid_f1 import HumanoidF1
 from utils.f1_hlc import speed_task_reward
+from utils.f1_hlc_gait import AlternatingGait, load_foot_vertices
 from utils.f1_hlc_metrics import HLCMetrics
 from utils.f1_hlc_curriculum import command_stage
 from utils.f1_hlc_velocity import (VelocityMetrics, heading_velocity, sample_velocity_commands,
@@ -16,6 +18,9 @@ class HumanoidF1HLC(HumanoidF1):
     def __init__(self, cfg, *args, **kwargs):
         self.hlc = cfg["env"]["hlc"]
         self.velocity_commands = self.hlc.get("commandMode") == "body_velocity"
+        gait_cfg = self.hlc.get("gaitReward")
+        if gait_cfg is not None and self.velocity_commands:
+            raise ValueError("gaitReward requires scalar forward commands")
         sequence_enabled = any(stage.get("restartSequenceProbability", 0.)
                                for stage in self.hlc.get("commandCurriculum", []))
         self.commands_at_interval_boundary = self.velocity_commands or sequence_enabled
@@ -23,8 +28,14 @@ class HumanoidF1HLC(HumanoidF1):
         if not 0 <= self.hlc.get("stopProbability", 0.) <= 1:
             raise ValueError("stopProbability must be in [0, 1]")
         super().__init__(cfg, *args, **kwargs)
-        self._hlc_foot_ids = [self._body_names.index(n) for n in
-                              ("left_ankle_roll_link", "right_ankle_roll_link")]
+        foot_names = ("left_ankle_roll_link", "right_ankle_roll_link")
+        self._hlc_foot_ids = [self._body_names.index(n) for n in foot_names]
+        self.gait = None
+        if gait_cfg is not None:
+            asset = cfg["env"]["asset"]
+            mjcf = Path(asset["assetRoot"]) / asset["assetFileName"]
+            vertices = load_foot_vertices(mjcf, foot_names)
+            self.gait = AlternatingGait(self.num_envs, self.device, self.dt, gait_cfg, vertices)
         self._hlc_leg_ids = [i for i, n in enumerate(self._dof_names)
                              if any(part in n for part in ("hip", "knee", "ankle"))]
         self.command_next_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -92,6 +103,8 @@ class HumanoidF1HLC(HumanoidF1):
 
     def _reset_envs(self, env_ids):
         if len(env_ids):
+            if self.gait is not None:
+                self.gait.reset(env_ids)
             if not self.velocity_commands and hasattr(self, "hlc_metrics"):
                 self.hlc_metrics.reset(env_ids)
             self._sample_commands(env_ids, reset=True)
@@ -192,6 +205,19 @@ class HumanoidF1HLC(HumanoidF1):
             self.hlc_metrics.step(self.target_speed, self._humanoid_root_states[:, 7],
                                   self._humanoid_root_states[:, 8], foot_sq.sqrt(), leg_sq.sqrt(),
                                   valid, failed, self.reset_buf.bool())
+            if self.gait is not None:
+                self._apply_gait_reward(valid, failed)
+
+    def _apply_gait_reward(self, valid, failed):
+        moving = self.target_speed > 1e-6
+        live = valid & moving & ~failed
+        feet = self._hlc_foot_ids
+        recent, alternating, complete, slip, stance = self.gait.step(
+            self._rigid_body_pos[:, feet], self._rigid_body_rot[:, feet], self._contact_forces[:, feet, 2], live)
+        shaped = self.gait.moving_reward(self.rew_buf, recent, alternating, slip, stance)
+        self.rew_buf[:] = torch.where(valid & moving, shaped, self.rew_buf)
+        self.extras["motion_metrics"]["task_reward"] = self.rew_buf.clone()
+        self.hlc_metrics.record_gait(live, recent, alternating, complete, slip, stance)
 
     def get_training_metadata(self):
         result = super().get_training_metadata()

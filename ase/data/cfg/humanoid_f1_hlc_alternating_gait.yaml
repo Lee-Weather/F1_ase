@@ -1,0 +1,31 @@
+extends: humanoid_f1_hlc_walk_stop_restart.yaml
+env:
+  hlc:
+    # Fit all three stages into the 300-iteration initial run.
+    commandCurriculum:
+      - untilEpoch: 50
+        speedRange: [0.3, 0.5]
+        stopProbability: 0.1
+      - untilEpoch: 100
+        speedRange: [0.2, 0.5]
+        stopProbability: 0.2
+        speedAnchors: [0.2, 0.3, 0.4]
+        anchorProbability: 0.4
+      - untilEpoch: 300
+        speedRange: [0.2, 0.5]
+        stopProbability: 0.2
+        speedAnchors: [0.2, 0.3, 0.4]
+        anchorProbability: 0.4
+        restartSequenceProbability: 0.5
+    gaitReward:
+      minContactForceN: 10.0
+      minSwingSeconds: 0.08
+      minClearanceM: 0.01
+      minAdvanceM: 0.03
+      minOppositeSupportFraction: 0.75
+      alternationMemorySeconds: 2.0
+      stanceVertexHeightM: 0.008
+      slipSpeedScaleMps: 0.10
+      speedRewardFloor: 0.35
+      alternatingStepBonus: 0.20
+      stanceSlipWeight: 0.25

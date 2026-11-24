@@ -36,10 +36,23 @@ class HLCMetrics:
         keys += ["{}/{}".format(kind, name) for kind in ("stop", "restart")
                  for name in ("requested", "unqualified", "completed", "successes", "failures",
                               "truncated", "success_delay_sum_s")]
+        if config.get("gaitReward") is not None:
+            keys += ["gait/" + name for name in ("moving_samples", "left_footfalls", "right_footfalls",
+                                                 "alternating_footfalls", "recent_alternation_samples",
+                                                 "stance_samples", "stance_slip_sum_m_s")]
         self.totals = {key: torch.zeros((), device=device) for key in keys}
 
     def _add(self, key, values):
         self.totals[key] += values.float().sum()
+
+    def record_gait(self, live, recent, alternating, complete, slip, stance):
+        self._add("gait/moving_samples", live)
+        self._add("gait/left_footfalls", complete[:, 0])
+        self._add("gait/right_footfalls", complete[:, 1])
+        self._add("gait/alternating_footfalls", alternating)
+        self._add("gait/recent_alternation_samples", recent > 0)
+        self._add("gait/stance_samples", stance)
+        self._add("gait/stance_slip_sum_m_s", slip)
 
     def _clear(self, ids):
         self.mode[ids] = 0
@@ -161,4 +174,12 @@ def summarize_hlc_metrics(totals):
             result["HLC_Events/" + kind + "_success_rate"] = successes / completed
         if successes:
             result["HLC_Events/" + kind + "_success_delay_mean_s"] = totals[kind + "/success_delay_sum_s"] / successes
+    if "gait/moving_samples" in totals:
+        for name in ("left_footfalls", "right_footfalls", "alternating_footfalls", "moving_samples", "stance_samples"):
+            result["HLC_Gait/" + name] = totals["gait/" + name]
+        if totals["gait/moving_samples"]:
+            result["HLC_Gait/recent_alternation_fraction"] = (
+                totals["gait/recent_alternation_samples"] / totals["gait/moving_samples"])
+        if totals["gait/stance_samples"]:
+            result["HLC_Gait/stance_slip_mean_m_s"] = totals["gait/stance_slip_sum_m_s"] / totals["gait/stance_samples"]
     return result
