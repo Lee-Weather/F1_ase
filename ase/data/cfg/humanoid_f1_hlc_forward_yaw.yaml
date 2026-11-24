@@ -1,0 +1,31 @@
+extends: humanoid_f1_hlc_velocity.yaml
+env:
+  hlc:
+    speedRange: [0.0, 0.5]
+    commandCurriculum:
+      # Groups are stop, forward, backward, left, right, left turn, right turn, mixed.
+      - untilEpoch: 200
+        commandWeights: [0.10, 0.70, 0, 0, 0, 0.10, 0.10, 0]
+        movingRanges: [[0.0, 0.50], [0, 0], [0, 0], [0.0, 0.20]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.20, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+      - untilEpoch: 600
+        commandWeights: [0.20, 0.50, 0, 0, 0, 0.10, 0.10, 0.10]
+        movingRanges: [[0.0, 0.50], [0, 0], [0, 0], [0.0, 0.20]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.20, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+        mixedAxes: [[1, 0, 1]]
+        mixedBackwardProbability: 0.0
+      - untilEpoch: 1800
+        commandWeights: [0.20, 0.40, 0, 0, 0, 0.10, 0.10, 0.20]
+        movingRanges: [[0.0, 0.50], [0, 0], [0, 0], [0.0, 0.20]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.20, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+        mixedAxes: [[1, 0, 1]]
+        mixedBackwardProbability: 0.0

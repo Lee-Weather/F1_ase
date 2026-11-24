@@ -23,6 +23,23 @@ class VelocityTests(unittest.TestCase):
         actual = heading_velocity(np.float32(0), np.float32(.8), -2., 3., .4)
         np.testing.assert_allclose(actual, [3., 2., .4], atol=1e-6)
 
+    def test_forward_yaw_curriculum_has_no_lateral_or_backward_commands(self):
+        path = Path(__file__).resolve().parents[1] / "data/cfg/humanoid_f1_hlc_forward_yaw.yaml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))["env"]["hlc"]
+        torch.manual_seed(20261124)
+        for stage in config["commandCurriculum"]:
+            command, groups = sample_velocity_commands(stage, 4000, "cpu")
+            self.assertTrue((command[:, 0] >= 0.).all())
+            self.assertTrue((command[:, 0] <= .5).all())
+            self.assertTrue((command[:, 1] == 0.).all())
+            self.assertTrue((command[:, 2].abs() <= .2).all())
+            self.assertTrue((command[:, 2] == -.2).any() and (command[:, 2] == .2).any())
+            self.assertTrue(torch.equal((command == 0).all(-1), groups == 0))
+            mixed = command[groups == 7]
+            self.assertTrue((mixed[:, 0] > 0).all())
+            self.assertTrue((mixed[:, 2] != 0).all())
+        self.assertTrue(((command[:, 0] > 0) & (command[:, 0] < .05)).any())
+
     def test_curriculum_bounds_and_command_groups(self):
         torch.manual_seed(20261122)
         for epoch, expected in ((1, 1), (200, 1), (201, 2), (600, 2), (601, 3), (1800, 3)):

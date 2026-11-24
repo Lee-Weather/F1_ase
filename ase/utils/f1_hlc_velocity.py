@@ -20,17 +20,18 @@ def sample_velocity_commands(stage, count, device):
         magnitudes[:, :3] = torch.where(selected, picks, magnitudes[:, :3])
 
     forward, backward, lateral, yaw = magnitudes.unbind(dim=-1)
+    if stage.get("yawAnchorProbability", 0.):
+        yaw = torch.where(torch.rand_like(yaw) < stage["yawAnchorProbability"], ranges[3, 1], yaw)
     vx = torch.where(groups == 1, forward, torch.where(groups == 2, -backward, 0.))
     vy = torch.where(groups == 3, lateral, torch.where(groups == 4, -lateral, 0.))
     wz = torch.where(groups == 5, yaw, torch.where(groups == 6, -yaw, 0.))
 
-    # Mixed commands use two axes or all three, with both signs represented.
-    axes = torch.tensor([[1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]], device=device)
+    axes = torch.tensor(stage.get("mixedAxes", [[1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]]), device=device)
     axes = axes[torch.randint(len(axes), (count,), device=device)]
-    signs = torch.rand((count, 3), device=device) < .5
-    mixed = torch.stack((torch.where(signs[:, 0], forward, -backward),
-                         torch.where(signs[:, 1], lateral, -lateral),
-                         torch.where(signs[:, 2], yaw, -yaw)), dim=-1) * axes
+    signs = torch.rand((count, 3), device=device)
+    mixed = torch.stack((torch.where(signs[:, 0] < 1 - stage.get("mixedBackwardProbability", .5), forward, -backward),
+                         torch.where(signs[:, 1] < .5, lateral, -lateral),
+                         torch.where(signs[:, 2] < .5, yaw, -yaw)), dim=-1) * axes
     command = torch.where((groups == 7)[:, None], mixed, torch.stack((vx, vy, wz), dim=-1))
     command[:, :2] *= stage["maxPlanarSpeed"] / command[:, :2].norm(dim=-1, keepdim=True).clamp_min(stage["maxPlanarSpeed"])
     return command, groups
