@@ -154,8 +154,8 @@ def control_interval(task, llc, z, llc_steps, step=None, on_step=None):
             on_step(task, z, action)
         if not active.any():
             break
-    if getattr(task, "velocity_commands", False):
-        updated = task.advance_velocity_commands(active)
+    if getattr(task, "commands_at_interval_boundary", False):
+        updated = task.advance_commands(active)
         result_obs[updated] = task.obs_buf[updated]
         result_states[updated] = task.states_buf[updated]
     info = dict(terminate=terminated.long(), termination_reasons=reasons, motion_metrics=metrics,

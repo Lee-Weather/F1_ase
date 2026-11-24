@@ -16,6 +16,9 @@ class HumanoidF1HLC(HumanoidF1):
     def __init__(self, cfg, *args, **kwargs):
         self.hlc = cfg["env"]["hlc"]
         self.velocity_commands = self.hlc.get("commandMode") == "body_velocity"
+        sequence_enabled = any(stage.get("restartSequenceProbability", 0.)
+                               for stage in self.hlc.get("commandCurriculum", []))
+        self.commands_at_interval_boundary = self.velocity_commands or sequence_enabled
         self.training_epoch = 0
         if not 0 <= self.hlc.get("stopProbability", 0.) <= 1:
             raise ValueError("stopProbability must be in [0, 1]")
@@ -25,6 +28,7 @@ class HumanoidF1HLC(HumanoidF1):
         self._hlc_leg_ids = [i for i, n in enumerate(self._dof_names)
                              if any(part in n for part in ("hip", "knee", "ankle"))]
         self.command_next_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.restart_sequence_step = torch.full_like(self.command_next_step, 3) if sequence_enabled else None
         if self.velocity_commands:
             self.target_velocity = torch.zeros((self.num_envs, 3), device=self.device)
             self.command_groups = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -50,13 +54,13 @@ class HumanoidF1HLC(HumanoidF1):
             self.target_velocity[ids] = commands
             self.command_groups[ids] = groups
         else:
-            self._sample_speed_commands(ids, stage)
+            self._sample_speed_commands(ids, stage, reset)
         steps = self.hlc["llcSteps"]
         lo, hi = [max(1, math.ceil(s/self.dt/steps)) for s in self.hlc["commandHoldSeconds"]]
         hold = torch.randint(lo, hi+1, (len(ids),), device=self.device)*steps
         self.command_next_step[ids] = hold if reset else self.progress_buf[ids]+hold
 
-    def _sample_speed_commands(self, ids, stage):
+    def _sample_speed_commands(self, ids, stage, reset):
         low, high = stage["speedRange"]
         self.target_speed[ids] = low + (high-low)*torch.rand(len(ids), device=self.device)
         anchors = stage.get("speedAnchors", [])
@@ -66,9 +70,20 @@ class HumanoidF1HLC(HumanoidF1):
             chosen = torch.randint(len(anchors), (len(ids),), device=self.device)
             self.target_speed[ids[selected]] = values[chosen[selected]]
         stop_probability = stage.get("stopProbability", 0.)
-        if stop_probability:
+        if stop_probability or self.restart_sequence_step is not None:
             stop = torch.rand(len(ids), device=self.device) < stop_probability
+            if self.restart_sequence_step is not None:
+                stop = self._scheduled_stop_mask(ids, stage, reset, stop)
             self.target_speed[ids[stop]] = 0
+
+    def _scheduled_stop_mask(self, ids, stage, reset, stop):
+        if reset:
+            probability = stage.get("restartSequenceProbability", 0.)
+            scheduled = torch.rand(len(ids), device=self.device) < probability
+            self.restart_sequence_step[ids] = torch.where(scheduled, 0, 3)
+        step = self.restart_sequence_step[ids]
+        self.restart_sequence_step[ids] = (step + 1).clamp(max=3)
+        return (step == 1) | ((step == 3) & stop)
 
     def set_training_epoch(self, epoch):
         # Preserve an already-issued command until its normal expiry. This also
@@ -83,13 +98,13 @@ class HumanoidF1HLC(HumanoidF1):
         super()._reset_envs(env_ids)
 
     def pre_physics_step(self, actions):
-        if not self.velocity_commands:
+        if not self.commands_at_interval_boundary:
             ids = (self.progress_buf >= self.command_next_step).nonzero(as_tuple=False).flatten()
             if len(ids):
                 self._sample_commands(ids)
         super().pre_physics_step(actions)
 
-    def advance_velocity_commands(self, active):
+    def advance_commands(self, active):
         """Issue the next command after the last transition of the old command."""
         ids = (active & (self.progress_buf >= self.command_next_step)).nonzero(as_tuple=False).flatten()
         if len(ids):

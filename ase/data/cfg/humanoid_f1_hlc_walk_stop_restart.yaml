@@ -1,0 +1,20 @@
+extends: humanoid_f1_hlc_0_06.yaml
+env:
+  hlc:
+    speedRange: [0.2, 0.5]
+    commandCurriculum:
+      - untilEpoch: 200
+        speedRange: [0.3, 0.5]
+        stopProbability: 0.1
+      - untilEpoch: 600
+        speedRange: [0.2, 0.5]
+        stopProbability: 0.2
+        speedAnchors: [0.2, 0.3, 0.4]
+        anchorProbability: 0.4
+      - untilEpoch: 1800
+        speedRange: [0.2, 0.5]
+        stopProbability: 0.2
+        speedAnchors: [0.2, 0.3, 0.4]
+        anchorProbability: 0.4
+        # In half of new episodes, issue positive, zero and positive in order.
+        restartSequenceProbability: 0.5
