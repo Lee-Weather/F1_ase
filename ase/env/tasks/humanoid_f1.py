@@ -11,7 +11,8 @@ from env.tasks.humanoid_amp import HumanoidAMP
 from env.tasks.humanoid_view_motion import HumanoidViewMotion
 from utils import torch_utils
 from utils.f1_motion_lib import F1MotionLib
-from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control, CONTROL_KEYS
+from utils.f1_control import (CONTROL_KEYS, action_to_targets,
+                              checkpoint_control, dof_armatures, pd_action_parameters)
 
 
 class HumanoidF1(HumanoidAMP):
@@ -41,13 +42,15 @@ class HumanoidF1(HumanoidAMP):
         self._dof_body_ids = [self._body_names.index(n) for n in self._critic_body_names[1:]]
         self._default_joint_pos = torch.tensor([self.cfg["env"]["defaultJointPos"][n] for n in self._dof_names], dtype=torch.float32, device=self.device)
         props = self.gym.get_asset_dof_properties(asset)
+        if "armature" in props.dtype.names:
+            props["armature"][:] = dof_armatures(self.cfg["env"], self._dof_names)
+        elif "dofArmature" in self.cfg["env"]:
+            raise RuntimeError("Isaac Gym does not expose DOF armature for this asset")
         for i, name in enumerate(self._dof_names):
             group = next(g for g in self.cfg["env"]["pdGains"] if g in name)
             props["stiffness"][i], props["damping"][i] = self.cfg["env"]["pdGains"][group]
             limit = joints[name].find("limit")
             props["effort"][i], props["velocity"][i] = float(limit.get("effort")), float(limit.get("velocity"))
-            if "armature" in props.dtype.names:
-                props["armature"][i] = self.cfg["env"]["armature"]
         self._f1_dof_props = props
 
     def _build_env(self, env_id, env_ptr, humanoid_asset):
@@ -98,7 +101,11 @@ class HumanoidF1(HumanoidAMP):
                 "motions": self._motion_lib.get_manifest()}
 
     def validate_control_config(self, saved):
-        for key, value in checkpoint_control({"control_config": saved} if saved is not None else {}).items():
+        saved = checkpoint_control({"control_config": saved} if saved is not None else {})
+        for key in ("assetArmature", "dofArmature"):
+            if key not in saved and key in self.cfg["env"]:
+                raise ValueError("Checkpoint control mismatch for " + key)
+        for key, value in saved.items():
             if self.cfg["env"].get(key) != value:
                 raise ValueError("Checkpoint control mismatch for " + key + "; start a fresh training run")
 

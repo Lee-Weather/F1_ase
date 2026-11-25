@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import yaml
-from utils.f1_control import pd_action_parameters, action_to_targets, checkpoint_control
+from utils.f1_control import action_to_targets, checkpoint_control, dof_armatures, pd_action_parameters
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSET = ROOT / "ase/data/assets/f1/mjcf/weichai_f1_29.xml"
@@ -328,7 +328,7 @@ class MujocoReplay:
             self.cfg, names, [float(limits[n].get("lower")) for n in names],
             [float(limits[n].get("upper")) for n in names])
         model.dof_damping[self.vids] = 0
-        model.dof_armature[self.vids] = self.cfg["armature"]
+        model.dof_armature[self.vids] = dof_armatures(self.cfg, names)
         self.base = model.body("base_link").id
         self.floor = model.geom("replay_ground").id
         self.allowed = {model.body(n).id for n in self.cfg["contactBodies"]}

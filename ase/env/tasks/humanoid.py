@@ -233,7 +233,8 @@ class Humanoid(BaseTask):
         asset_options.angular_damping = 0.01
         asset_options.max_angular_velocity = 100.0
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-        asset_options.armature = self.cfg["env"].get("armature", 0.0)
+        env_cfg = self.cfg["env"]
+        asset_options.armature = env_cfg.get("assetArmature", env_cfg.get("armature", 0.0))
         #asset_options.fix_base_link = True
         humanoid_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
         self._configure_asset(humanoid_asset)

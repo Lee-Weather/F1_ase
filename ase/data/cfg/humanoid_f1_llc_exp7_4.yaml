@@ -1,0 +1,18 @@
+extends: humanoid_f1.yaml
+env:
+  # Use the URDF rigid body inertias and add rotor inertia in DOF space.
+  assetArmature: 0.0
+  dofArmature:
+    hip_pitch: 0.063828
+    hip_roll: 0.063828
+    hip_yaw: 0.063828
+    knee_pitch: 0.063828
+    ankle_pitch: 0.17428608
+    ankle_roll: 0.0648
+  pdGains:
+    hip_pitch: [65.0, 8.0]
+    hip_roll: [70.0, 8.0]
+    hip_yaw: [90.0, 4.2]
+    knee_pitch: [90.0, 6.9]
+    ankle_pitch: [60.0, 4.3]
+    ankle_roll: [49.0, 2.4]

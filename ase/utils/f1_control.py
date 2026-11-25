@@ -1,10 +1,24 @@
-"""Shared F1 action mapping for training and both replay simulators."""
+"""Shared F1 drive configuration for training and both replay simulators."""
+import math
+
 import numpy as np
 
 
 LEGACY_CONTROL = {"actionMapping": "default_offset", "actionScale": 0.5}
 CONTROL_KEYS = ("actionMapping", "actionScale", "actionLimitMargin", "defaultJointPos",
-                "pdGains", "armature", "controlFrequencyInv")
+                "pdGains", "armature", "assetArmature", "dofArmature", "controlFrequencyInv")
+
+
+def dof_armatures(env, names):
+    """Resolve optional per-drive-group inertia in the simulator's joint order."""
+    groups = env.get("dofArmature", {})
+    if set(groups) - set(env["pdGains"]):
+        raise ValueError("dofArmature keys must be groups in pdGains")
+    default = env["armature"]
+    if any(not math.isfinite(value) or value < 0 for value in (default, *groups.values())):
+        raise ValueError("DOF armature values must be finite and nonnegative")
+    return [groups.get(next(group for group in env["pdGains"] if group in name), default)
+            for name in names]
 
 
 def pd_action_parameters(env, names, lower, upper):
