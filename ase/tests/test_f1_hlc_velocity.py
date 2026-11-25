@@ -40,6 +40,27 @@ class VelocityTests(unittest.TestCase):
             self.assertTrue((mixed[:, 2] != 0).all())
         self.assertTrue(((command[:, 0] > 0) & (command[:, 0] < .05)).any())
 
+    def test_forward_lateral_yaw_reaches_signed_limits_without_backward(self):
+        path = Path(__file__).resolve().parents[1] / "data/cfg/humanoid_f1_hlc_forward_lateral_yaw.yaml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))["env"]["hlc"]
+        torch.manual_seed(20261125)
+        for epoch, stage_index in ((1, 1), (200, 1), (201, 2), (600, 2), (601, 3), (1800, 3)):
+            with self.subTest(epoch=epoch):
+                index, stage = command_stage(config, epoch)
+                self.assertEqual(index, stage_index)
+                command, groups = sample_velocity_commands(stage, 8192, "cpu")
+                vx, vy, wz = command.unbind(-1)
+                self.assertTrue(((vx >= 0) & (vx <= .50) & (vy.abs() <= .40) & (wz.abs() <= .40)).all())
+                self.assertFalse((groups == 2).any())
+                self.assertTrue(torch.equal((command == 0).all(-1), groups == 0))
+                self.assertTrue((vx == .50).any())
+                for axis in (vy, wz):
+                    self.assertTrue((axis == -.4).any() and (axis == .4).any())
+                mixed = command[groups == 7]
+                expected = stage.get("mixedAxes", [])
+                self.assertEqual({tuple(row) for row in (mixed != 0).long().tolist()}, {tuple(row) for row in expected})
+                self.assertGreaterEqual(stage["maxPlanarSpeed"], .64032)
+
     def test_curriculum_bounds_and_command_groups(self):
         torch.manual_seed(20261122)
         for epoch, expected in ((1, 1), (200, 1), (201, 2), (600, 2), (601, 3), (1800, 3)):

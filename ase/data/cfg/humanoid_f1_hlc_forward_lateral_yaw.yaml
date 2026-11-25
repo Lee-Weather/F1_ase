@@ -1,0 +1,23 @@
+extends: humanoid_f1_hlc_forward_yaw.yaml
+env:
+  hlc:
+    commandCurriculum:
+      # Stop, forward, backward, left, right, turn left, turn right, mixed.
+      - &axis_ranges
+        untilEpoch: 200
+        commandWeights: [0.10, 0.30, 0, 0.15, 0.15, 0.15, 0.15, 0]
+        movingRanges: [[0.0, 0.50], [0, 0], [0.0, 0.40], [0.0, 0.40]]
+        # The corner (0.50, 0.40) has a planar magnitude of about 0.640 m/s.
+        maxPlanarSpeed: 0.65
+        lowSpeedAnchors: [0.10, 0.20, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+        mixedBackwardProbability: 0.0
+      - <<: *axis_ranges
+        untilEpoch: 600
+        commandWeights: [0.15, 0.25, 0, 0.10, 0.10, 0.10, 0.10, 0.20]
+        mixedAxes: [[1, 1, 0], [1, 0, 1], [0, 1, 1]]
+      - <<: *axis_ranges
+        untilEpoch: 1800
+        commandWeights: [0.20, 0.20, 0, 0.10, 0.10, 0.075, 0.075, 0.25]
+        mixedAxes: [[1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]]
