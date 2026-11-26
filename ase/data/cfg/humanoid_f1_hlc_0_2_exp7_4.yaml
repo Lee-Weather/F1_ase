@@ -1,0 +1,18 @@
+extends: humanoid_f1_llc_exp7_4.yaml
+env:
+  stateInit: Default
+  episodeLength: 1501  # 30 s at the LLC control rate.
+  # Match the exp_f1_8.5 speed task while inheriting the 7.4 actuator profile.
+  hlc:
+    llcSteps: 5
+    speedRange: [0.0, 2.0]
+    commandHoldSeconds: [5.0, 8.0]
+    speedTrackingScale: 4.0
+    lateralTrackingScale: 2.0
+    headingTrackingScale: 2.0
+    stopProbability: 0.2
+    standFootSpeedScale: 2.0
+    standLegVelocityScale: 0.05
+    quietPlanarSpeed: 0.05
+    quietFootSpeed: 0.1
+    quietLegVelocity: 0.3
