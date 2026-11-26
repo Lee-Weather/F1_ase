@@ -1,0 +1,17 @@
+extends: humanoid_f1_llc_exp7_4.yaml
+env:
+  stateInit: Default
+  episodeLength: 1501  # 30 s at 50 Hz.
+  hlc:
+    commandMode: body_velocity
+    llcSteps: 5
+    commandHoldSeconds: [5.0, 8.0]
+    velocityTrackingSigma: [0.15, 0.12, 0.25]
+    standingSpeedSigma: 0.05
+    standingYawSigma: 0.10
+    standFootSpeedScale: 2.0
+    standLegVelocityScale: 0.05
+    quietPlanarSpeed: 0.05
+    quietYawRate: 0.10
+    quietFootSpeed: 0.10
+    quietLegVelocity: 0.30

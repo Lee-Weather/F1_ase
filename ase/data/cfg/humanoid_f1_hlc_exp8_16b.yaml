@@ -1,0 +1,25 @@
+extends: humanoid_f1_hlc_exp7_5.yaml
+env:
+  hlc:
+    commandCurriculum:
+      # Ranges hold positive magnitudes for forward, backward, lateral and yaw.
+      - untilEpoch: 300
+        commandWeights: [0.20, 0.24, 0.12, 0.12, 0.12, 0.10, 0.10, 0]
+        movingRanges: [[0.15, 0.35], [0.10, 0.18], [0.10, 0.18], [0.10, 0.15]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.15, 0.18, 0.20, 0.30, 0.35]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+      - &full_single_axis_curriculum
+        untilEpoch: 800
+        commandWeights: [0.25, 0.20, 0.11, 0.12, 0.12, 0.10, 0.10, 0]
+        movingRanges: [[0.08, 0.50], [0.08, 0.25], [0.08, 0.25], [0.10, 0.25]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        yawAnchorProbability: 0.4
+      - <<: *full_single_axis_curriculum
+        untilEpoch: 1800
+        commandWeights: [0.25, 0.16, 0.10, 0.10, 0.10, 0.07, 0.07, 0.15]
+        mixedAxes: [[1, 1, 0], [1, 0, 1], [0, 1, 1]]
+        mixedBackwardProbability: 0.5
