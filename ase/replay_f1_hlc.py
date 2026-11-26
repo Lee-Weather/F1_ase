@@ -1,4 +1,4 @@
-"""Replay a frozen-LLC F1 HLC with scalar or three-axis velocity commands."""
+"""Replay F1 HLC checkpoints with scalar or three-axis velocity commands."""
 import argparse
 import csv
 import hashlib
@@ -31,15 +31,21 @@ def export_numpy_replay(checkpoint, llc_checkpoint, policy_npz, llc_policy_npz):
     _, saved = load_hlc_actor(checkpoint, llc, "cpu")
     metadata = {key: saved[key] for key in
                 ("epoch", "training_metadata", "hlc_config", "llc_dependency", "control_config")}
+    fine_tune = saved.get("llc_finetune")
+    hlc_sha256 = hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()
+    if fine_tune is not None:
+        metadata["mixed_llc"] = True
     weights = {key[len("a2c_network."):]: value.detach().float().numpy()
                for key, value in saved["model"].items()
                if key.startswith(("a2c_network.actor_mlp.", "a2c_network.mu."))}
     weights.update(mean=saved["running_mean_std"]["running_mean"].float().numpy(),
                    scale=np.sqrt(saved["running_mean_std"]["running_var"].float().numpy() + 1e-5),
                    metadata=np.array(json.dumps(metadata)),
-                   source_sha256=np.array(hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest()))
+                   source_sha256=np.array(hlc_sha256))
     np.savez_compressed(policy_npz, **weights)
-    export_actor_npz(llc_checkpoint, llc_policy_npz)
+    export_actor_npz(llc_checkpoint, llc_policy_npz,
+                     output_head=fine_tune["head"] if fine_tune is not None else None,
+                     paired_hlc_sha256=hlc_sha256)
 
 
 def load_numpy_replay(checkpoint, llc_checkpoint, policy_npz, llc_policy_npz):
@@ -54,6 +60,9 @@ def load_numpy_replay(checkpoint, llc_checkpoint, policy_npz, llc_policy_npz):
     expected = saved["llc_dependency"]["sha256"]
     if llc.source_sha256 != expected or hashlib.sha256(Path(llc_checkpoint).read_bytes()).hexdigest() != expected:
         raise ValueError("NumPy HLC checkpoint requires a different LLC")
+    expected_pair = str(weights["source_sha256"]) if saved.get("mixed_llc") else ""
+    if llc.paired_hlc_sha256 != expected_pair:
+        raise ValueError("NumPy LLC weights belong to a different HLC pair")
     llc.metadata = saved["llc_dependency"]
     layers = sorted(int(key.split(".")[1]) for key in weights
                     if key.startswith("actor_mlp.") and key.endswith(".weight"))

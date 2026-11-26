@@ -86,7 +86,7 @@ def joint_names():
     return [j.get("name") for j in ET.parse(ASSET).iter("joint")]
 
 
-def export_actor_npz(checkpoint, destination):
+def export_actor_npz(checkpoint, destination, output_head=None, paired_hlc_sha256=""):
     """Export inference weights for hosts without a working PyTorch runtime."""
     import torch
     kwargs = {"weights_only": False} if "weights_only" in inspect.signature(torch.load).parameters else {}
@@ -94,6 +94,9 @@ def export_actor_npz(checkpoint, destination):
     weights = {k[len("a2c_network."):]: v.detach().float().numpy()
                for k, v in ckpt["model"].items()
                if k.startswith("a2c_network.actor_mlp.") or k.startswith("a2c_network.mu.")}
+    if output_head is not None:
+        weights.update({f"mu.{key}": value.detach().cpu().float().numpy() for key, value in output_head.items()})
+        weights["paired_hlc_sha256"] = np.array(paired_hlc_sha256)
     weights.update(mean=ckpt["running_mean_std"]["running_mean"].float().numpy(),
                    scale=np.sqrt(ckpt["running_mean_std"]["running_var"].float().numpy() + 1e-5),
                    epoch=np.array(ckpt["epoch"]),
@@ -131,6 +134,7 @@ def load_actor_numpy(path):
     actor.algorithm = "ASE" if is_ase else "AMP"
     actor.control_config = json.loads(str(weights["control_config"]))
     actor.source_sha256 = str(weights.get("source_sha256", ""))
+    actor.paired_hlc_sha256 = str(weights.get("paired_hlc_sha256", ""))
     return actor
 
 

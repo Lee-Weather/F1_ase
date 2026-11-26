@@ -253,6 +253,9 @@ def cloud_observer_class(entry, args):
                 if key in train_info:
                     metrics[label] = mean_metric(train_info[key])
             summary = self._last_summary
+            if "mixed_metrics" in train_info:
+                metrics.update(train_info["mixed_metrics"])
+                summary["mixed"] = train_info["mixed_metrics"]
             metrics["Mean reward (training, per step)"] = summary["mean_reward"]
             if "mean_episode_length" in summary:
                 metrics.update({"Mean episode length (steps)": summary["mean_episode_length"],

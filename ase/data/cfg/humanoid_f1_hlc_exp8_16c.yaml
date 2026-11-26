@@ -1,0 +1,10 @@
+extends: humanoid_f1_hlc_exp8_16b.yaml
+env:
+  hlc:
+    llcFineTune:
+      warmupEpochs: 300
+      updateEvery: 5
+      learningRate: 0.000002
+      actionStd: 0.03
+      anchorWeight: 100.0
+      minibatchSize: 2048

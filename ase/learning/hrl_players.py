@@ -277,6 +277,5 @@ class HRLPlayer(common_player.CommonPlayer):
     def restore(self, fn):
         if self.config.get('frozen_f1_llc', False) and fn != 'Base':
             weights = torch_ext.load_checkpoint(fn)
-            if weights.get('llc_dependency') != self._llc_agent.metadata:
-                raise ValueError('HLC checkpoint requires a different LLC')
+            self._llc_agent.use_hlc_checkpoint(weights)
         return super().restore(fn)

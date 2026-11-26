@@ -320,6 +320,8 @@ class HRLAgent(common_agent.CommonAgent):
 
     def set_full_state_weights(self, weights):
         if self.config.get('frozen_f1_llc', False):
+            if "llc_finetune" in weights and not self.vec_env.env.task.hlc.get("llcFineTune"):
+                raise ValueError("Resume a mixed HLC checkpoint with the alternating-training configuration")
             if weights.get('llc_dependency') != self._llc_agent.metadata:
                 raise ValueError('HLC checkpoint requires a different LLC')
         return super().set_full_state_weights(weights)

@@ -66,6 +66,8 @@ class FrozenF1LLC(nn.Module):
                 self.register_buffer(prefix + "_" + stat, value.detach().clone())
         if self.actor_running_mean.numel() != 93 or self.amp_running_mean.numel() != 890:
             raise ValueError("Expected F1 actor93 and AMP890")
+        self.register_buffer("base_mu_weight", self.mu__weight.clone(), persistent=False)
+        self.register_buffer("base_mu_bias", self.mu__bias.clone(), persistent=False)
         self.control_config = checkpoint_control(saved)
         self.metadata = dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                              epoch=int(saved["epoch"]), frame=int(saved.get("frame", 0)),
@@ -82,8 +84,7 @@ class FrozenF1LLC(nn.Module):
         var = getattr(self, prefix+"_running_var").float()
         return ((x.float()-mean) / torch.sqrt(var+1e-5)).clamp(-5, 5)
 
-    @torch.no_grad()
-    def forward(self, obs, z):
+    def actor_features(self, obs, z):
         obs = self._normalize(obs, "actor")
         style = F.relu(self._linear(z, "actor_mlp._style_mlp.0"))
         style = F.relu(self._linear(style, "actor_mlp._style_mlp.2"))
@@ -91,7 +92,27 @@ class FrozenF1LLC(nn.Module):
         hidden = torch.cat((obs, style), -1)
         for i in range(3):
             hidden = F.relu(self._linear(hidden, "actor_mlp._dense_layers."+str(i)))
-        return self._linear(hidden, "mu").clamp(-1, 1)
+        return hidden
+
+    @torch.no_grad()
+    def forward(self, obs, z):
+        return self._linear(self.actor_features(obs, z), "mu").clamp(-1, 1)
+
+    @torch.no_grad()
+    def set_output_head(self, head):
+        weight, bias = self.mu__weight, self.mu__bias
+        if head["weight"].shape != weight.shape or head["bias"].shape != bias.shape:
+            raise ValueError("LLC output head shape differs from the base model")
+        weight.copy_(head["weight"])
+        bias.copy_(head["bias"])
+
+    def use_hlc_checkpoint(self, saved):
+        if saved.get("llc_dependency") != self.metadata:
+            raise ValueError("HLC checkpoint requires a different LLC")
+        fine_tune = saved.get("llc_finetune")
+        head = fine_tune["head"] if fine_tune is not None else {
+            "weight": self.base_mu_weight, "bias": self.base_mu_bias}
+        self.set_output_head(head)
 
     @torch.no_grad()
     def discriminator(self, amp):
@@ -107,7 +128,7 @@ class FrozenF1LLC(nn.Module):
 
 
 @torch.no_grad()
-def control_interval(task, llc, z, llc_steps, step=None, on_step=None):
+def control_interval(task, llc, z, llc_steps, step=None, on_step=None, sample_action=None):
     """One HLC action; latch first terminal states and exclude later substeps.
 
     Surviving environments finish the interval. A terminated environment is not
@@ -125,7 +146,8 @@ def control_interval(task, llc, z, llc_steps, step=None, on_step=None):
     reasons, metrics = {}, {}
     terminal_steps = torch.zeros(count, dtype=torch.long, device=task.device)
     for index in range(llc_steps):
-        action = llc(task.obs_buf[:, :93], z)
+        obs = task.obs_buf[:, :93]
+        action = llc(obs, z) if sample_action is None else sample_action(obs, z, active, index)
         action[~active] = 0
         if step is None:
             task.step(action)
@@ -170,8 +192,7 @@ def load_hlc_actor(checkpoint, llc, device):
     """Deterministic ReLU HRL actor; critic is unnecessary for recorded replay."""
     kwargs = {"weights_only": False} if "weights_only" in inspect.signature(torch.load).parameters else {}
     saved = torch.load(str(checkpoint), map_location=device, **kwargs)
-    if saved.get("llc_dependency") != llc.metadata:
-        raise ValueError("HLC checkpoint requires a different LLC")
+    llc.use_hlc_checkpoint(saved)
     weights = {k[len("a2c_network."):]: v.detach() for k, v in saved["model"].items()}
     stats = saved["running_mean_std"]
     mean, var = stats["running_mean"].float(), stats["running_var"].float()
