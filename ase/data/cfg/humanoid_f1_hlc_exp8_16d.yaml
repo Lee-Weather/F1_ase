@@ -1,0 +1,20 @@
+extends: humanoid_f1_hlc_exp8_16a.yaml
+env:
+  hlc:
+    commandCurriculum:
+      # Epochs are absolute, starting from the 8.16a epoch-1800 checkpoint.
+      # Stop, forward, backward, left, right, left turn, right turn, mixed.
+      - &forward_backward_turn
+        untilEpoch: 2000
+        commandWeights: [0.25, 0.60, 0.10, 0, 0, 0, 0, 0.05]
+        movingRanges: [[0.08, 0.50], [0.08, 0.15], [0, 0], [0.08, 0.12]]
+        maxPlanarSpeed: 0.50
+        lowSpeedAnchors: [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
+        anchorProbability: 0.4
+        mixedAxes: [[1, 0, 1]]
+        mixedBackwardProbability: 0.0
+        mixedForwardRange: [0.15, 0.35]
+      - <<: *forward_backward_turn
+        untilEpoch: 2400
+        commandWeights: [0.25, 0.50, 0.15, 0, 0, 0, 0, 0.10]
+        movingRanges: [[0.08, 0.50], [0.08, 0.20], [0, 0], [0.08, 0.20]]

@@ -24,7 +24,8 @@ def sample_velocity_commands(stage, count, device):
     groups = torch.multinomial(torch.tensor(stage["commandWeights"], device=device, dtype=torch.float32),
                               count, replacement=True)
     ranges = torch.tensor(stage["movingRanges"], device=device, dtype=torch.float32)
-    magnitudes = ranges[:, 0] + torch.rand((count, 4), device=device) * (ranges[:, 1] - ranges[:, 0])
+    uniform_samples = torch.rand((count, 4), device=device)
+    magnitudes = ranges[:, 0] + uniform_samples * (ranges[:, 1] - ranges[:, 0])
     anchors = stage.get("lowSpeedAnchors", [])
     if anchors:
         anchors = torch.tensor(anchors, device=device)
@@ -43,7 +44,11 @@ def sample_velocity_commands(stage, count, device):
     axes = torch.tensor(stage.get("mixedAxes", [[1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]]), device=device)
     axes = axes[torch.randint(len(axes), (count,), device=device)]
     signs = torch.rand((count, 3), device=device)
-    mixed = torch.stack((torch.where(signs[:, 0] < 1 - stage.get("mixedBackwardProbability", .5), forward, -backward),
+    mixed_forward = forward
+    if "mixedForwardRange" in stage:
+        low, high = stage["mixedForwardRange"]
+        mixed_forward = low + uniform_samples[:, 0] * (high - low)
+    mixed = torch.stack((torch.where(signs[:, 0] < 1 - stage.get("mixedBackwardProbability", .5), mixed_forward, -backward),
                          torch.where(signs[:, 1] < .5, lateral, -lateral),
                          torch.where(signs[:, 2] < .5, yaw, -yaw)), dim=-1) * axes
     command = torch.where((groups == 7)[:, None], mixed, torch.stack((vx, vy, wz), dim=-1))

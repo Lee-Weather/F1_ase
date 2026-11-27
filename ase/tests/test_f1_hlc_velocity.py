@@ -78,6 +78,33 @@ class VelocityTests(unittest.TestCase):
             if index == 3:
                 self.assertTrue(torch.all((target[groups == 7] != 0).sum(-1) >= 2))
 
+    def test_resume_curriculum_retains_forward_range_and_limits_compound_turns(self):
+        path = Path(__file__).resolve().parents[1] / "data/cfg/humanoid_f1_hlc_exp8_16d.yaml"
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))["env"]["hlc"]
+        torch.manual_seed(20261127)
+        for epoch, expected_stage, backward_limit, yaw_limit in (
+            (1801, 1, .15, .12), (2000, 1, .15, .12), (2001, 2, .20, .20), (2400, 2, .20, .20)
+        ):
+            with self.subTest(epoch=epoch):
+                index, stage = command_stage(config, epoch)
+                self.assertEqual(index, expected_stage)
+                target, groups = sample_velocity_commands(stage, 12000, "cpu")
+                vx, vy, wz = target.unbind(-1)
+                forward, backward, turning = groups == 1, groups == 2, groups == 7
+                self.assertTrue(torch.equal((target == 0).all(-1), groups == 0))
+                self.assertTrue((vy == 0).all())
+                self.assertTrue(((vx[forward] >= .08) & (vx[forward] <= .50)).all())
+                self.assertTrue((vx[forward] == .50).any())
+                self.assertTrue(((vx[backward] >= -backward_limit) & (vx[backward] <= -.08)).all())
+                self.assertTrue(((vx[turning] >= .15) & (vx[turning] <= .35)).all())
+                self.assertTrue(((wz[turning].abs() >= .08) & (wz[turning].abs() <= yaw_limit)).all())
+                self.assertTrue((wz[turning] < 0).any() and (wz[turning] > 0).any())
+                self.assertTrue((wz[~turning] == 0).all())
+                weights = torch.tensor(stage["commandWeights"])
+                counts = torch.bincount(groups, minlength=len(weights))
+                self.assertTrue(torch.equal(counts > 0, weights > 0))
+                torch.testing.assert_close(counts / len(groups), weights, atol=.02, rtol=0.)
+
     def test_reward_supports_signed_axes_and_torch_numpy_parity(self):
         commands = np.array([[.4,0,0], [-.25,0,0], [0,.2,0], [0,-.2,0],
                              [0,0,.3], [0,0,-.3], [.25,-.1,.2], [0,0,0]], dtype=np.float32)
